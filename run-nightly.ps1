@@ -130,12 +130,50 @@ if (-not $EvalOnly) {
         $scanMsg = "Today is $Date. Project directory: $ProjectDir. Execute the full portal scan as described in your system instructions. Report how many new jobs were added to data/pipeline.md."
         Push-Location $ProjectDir
         try {
+            # ==================== SCAN SAFETY GATE + SCOPING (P0, 2026-07-03) ====================
+            # SCAN drives the Playwright MCP over UNTRUSTED job portals. It previously ran
+            # --dangerously-skip-permissions (full tool access - the P0). Two changes:
+            #
+            #   1. INTERLOCK: scan REFUSES to run unless CAREEROPS_ALLOW_SCAN=1 is set explicitly.
+            #      This is defense-in-depth on top of the scheduled task being Disabled: two
+            #      independent locks (task Disabled AND this gate) instead of relying on one.
+            #      Re-enabling the task alone will NOT fire a scan.
+            #
+            #   2. SCOPED command (pre-staged, ACTIVE below): replaces skip-permissions with an
+            #      allowlist + dontAsk, no Bash. UNVERIFIED HEADLESS - the dontAsk / project-MCP
+            #      trust behavior for the Playwright MCP has not been tested end-to-end. The
+            #      --dangerously-skip-permissions fallback is kept commented out below.
+            #
+            # REACTIVATION CHECKLIST (do these when you resume career-ops for real usage):
+            #   [ ] $env:CAREEROPS_ALLOW_SCAN = '1'
+            #   [ ] run: .\run-nightly.ps1 -ScanOnly   (watch for MCP permission prompts / hangs)
+            #   [ ] confirm new jobs land in data/pipeline.md and no unexpected tool calls occur
+            #   [ ] once verified, DELETE the commented skip-permissions fallback block below
+            #   [ ] bundle with the correctness-spec rewrite (tracker frozen / drain / filter leak)
+            # Tracking: wiki/meta/2026-07-03-portfolio-fix-matrix.md (career-ops P0).
+            # ====================================================================================
+            if ($env:CAREEROPS_ALLOW_SCAN -ne '1') {
+                throw "SCAN blocked: unverified headless scan path (P0 residual). Set CAREEROPS_ALLOW_SCAN=1 to run scan, after reading the SCAN SAFETY GATE in run-nightly.ps1."
+            }
+
+            # --- Scoped scan (pre-staged; VERIFY headless before trusting) ---
             & claude --print `
-                --dangerously-skip-permissions `
+                --allowedTools "Read,Write,Edit,WebFetch,WebSearch,mcp__playwright" `
+                --permission-mode dontAsk `
                 --append-system-prompt-file $ScanSysFile `
                 $scanMsg `
                 | Out-File $scanLog -Encoding utf8
             $scanExit = $LASTEXITCODE
+
+            # --- FALLBACK: full tool access over UNTRUSTED portals. UNSAFE. Do NOT uncomment
+            #     unless the scoped command above fails AND you accept the risk. Delete once the
+            #     scoped scan is verified working headless. ---
+            # & claude --print `
+            #     --dangerously-skip-permissions `
+            #     --append-system-prompt-file $ScanSysFile `
+            #     $scanMsg `
+            #     | Out-File $scanLog -Encoding utf8
+            # $scanExit = $LASTEXITCODE
         } finally {
             Pop-Location
         }
@@ -205,7 +243,8 @@ foreach ($line in $newLines) {
     Push-Location $ProjectDir
     try {
         & claude --print `
-            --dangerously-skip-permissions `
+            --allowedTools "Read,Write,Glob,Grep,WebFetch,WebSearch,Bash(node generate-pdf.mjs *)" `
+            --permission-mode dontAsk `
             --append-system-prompt-file $resolvedPath `
             $userMsg `
             | Out-File $logFile -Encoding utf8
