@@ -14,6 +14,17 @@
  * Run: node career-ops/merge-tracker.mjs [--dry-run] [--verify]
  */
 
+// ─── DISARMED 2026-06-11 ────────────────────────────────────────────────────
+// Fable review (D:\sunja\docs\fable-reviews\review-career-ops.md) found 3 dedup
+// bugs that corrupt applications.md on any real run: bare entry-number match
+// overwrites unrelated rows (105 pending TSVs claim #44), pipe-branch
+// filter(Boolean) shifts columns + wrong score/status order, no intra-run dedup
+// (half-merged duplicate rows). Remove this guard only after those are fixed.
+console.error('DISARMED: merge-tracker.mjs has known tracker-corrupting dedup bugs.');
+console.error('See review-career-ops.md before re-enabling. Exiting without touching anything.');
+process.exit(1);
+// ────────────────────────────────────────────────────────────────────────────
+
 import { readFileSync, writeFileSync, readdirSync, mkdirSync, renameSync, existsSync } from 'fs';
 import { join, basename, dirname } from 'path';
 import { fileURLToPath } from 'url';
