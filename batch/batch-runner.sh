@@ -353,7 +353,8 @@ process_offer() {
   # Launch claude -p worker (uses default model from Claude Max subscription)
   local exit_code=0
   claude -p \
-    --dangerously-skip-permissions \
+    --allowedTools "Read,Write,Glob,Grep,WebFetch,WebSearch,Bash(node generate-pdf.mjs *)" \
+    --permission-mode dontAsk \
     --append-system-prompt-file "$resolved_prompt" \
     "$prompt" \
     > "$log_file" 2>&1 || exit_code=$?

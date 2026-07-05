@@ -355,3 +355,5 @@ Write one TSV file per evaluation to `batch/tracker-additions/{num}-{company-slu
 - **Dead URL bulk check** — Python `urllib.request` HEAD requests reliably detect 404s on Greenhouse/Ashby/Lever; ~30% of scan results go stale within weeks; run before large batch evals
 - **decisions.jsonl is append-only** — lives in Vault (`Fortress of Solitude\career-ops\decisions.jsonl`), not project dir; wipe manually after test runs
 - **LinkedIn public job URLs** — work via Playwright without login; safe to add to pipeline.md
+- **PDF verification is mandatory** — after every pipeline run, explicitly assert the PDF file exists and is non-null before reporting success; `pdf: null` in 8+ sessions went unreported; log `❌` in tracker and surface the failure explicitly rather than silently skipping
+- **Tracker count: verify before reporting** — after adding entries, re-read `data/pipeline.md` and `data/applications.md` and count the actual diff; report the verified count, not the expected count — truncated outputs and dedup edge cases have caused count mismatches repeatedly

@@ -44,7 +44,9 @@ batch/
    c. Calcular siguiente REPORT_NUM secuencial
    d. Ejecutar via Bash:
       ```bash
-      claude -p --dangerously-skip-permissions \
+      claude -p \
+        --allowedTools "Read,Write,Glob,Grep,WebFetch,WebSearch,Bash(node generate-pdf.mjs *)" \
+        --permission-mode dontAsk \
         --append-system-prompt-file batch/batch-prompt.md \
         "Procesa esta oferta. URL: {url}. JD: /tmp/batch-jd-{id}.txt. Report: {num}. ID: {id}"
       ```
