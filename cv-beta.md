@@ -1,19 +1,19 @@
 # Sunjay D. Kelkar
 
 **Location:** Seattle Metro Area, WA | Remote Only  
-**Email:** [your-email@example.com]  
-**LinkedIn:** [linkedin.com/in/yourprofile]  
+**Email:** sunjay.kelkar@gmail.com
+**LinkedIn:** linkedin.com/in/sunjaykelkar
 **GitHub:** github.com/sdkkds
 
 ---
 
 ## Summary
 
-Strategic and technically adept IT leader with 25+ years of deep operational experience in enterprise technology, with a focus on cybersecurity, cloud infrastructure, and security program management. Twelve years of experience in project management and technical leadership.
+Strategic and technically adept IT leader with 30+ years of deep operational experience across SMB and enterprise technology, with a focus on cybersecurity, cloud infrastructure, and security program management. Fourteen years of experience in project/program management and technical leadership.
 
 - Cybersecurity product owner driving vulnerability management and penetration testing programs in healthcare
 - Led parallel penetration testing engagements and security remediation programs for Fortune 10/200 clients at a top global security consultancy
-- Built and managed bi-coastal teams of 45+ engineers running 24/7/365 Azure Government infrastructure for Microsoft
+- Built and managed bi-coastal teams of up to 60 engineers running 24/7/365 Azure Government infrastructure for Microsoft
 - Security incident manager across large-scale enterprise environments: service outages, crisis management, security incidents
 - Engaging and versatile communicator — equally effective with engineers, executives, and non-technical audiences
 
@@ -24,19 +24,20 @@ Strategic and technically adept IT leader with 25+ years of deep operational exp
 ### Senior IT Product Owner — Cybersecurity (Offensive Security)
 **[Health Insurance Company]** | Seattle Metro Area, WA (Remote) | May 2023 – Present
 
-- Product owner for the Offensive Security Red Team; manage features and user stories in Azure DevOps and Jira Align for a 6-person Red Team (4 operators, 1 lead/Director of Offensive Security), aligned to enterprise SAFe Agile cadences
+- Product owner for a 5-person Red Team (3 operators, an Associate Director, and the Director of Offensive Security); manage features and user stories in Azure DevOps and Jira Align, aligned to enterprise SAFe Agile cadences
 - Reclassified from Senior Penetration Testing Coordinator to Sr. IT Product Owner as part of company-wide Agile enablement; scope and responsibilities formalized under product ownership model
 - Previously one of 5 coordinators managing 100+ annual penetration testing engagements across internal application and infrastructure development teams
-- Surpassed annual penetration testing completion targets in both 2023 and 2024 — highest engagement volume in team history
+- Surpassed annual penetration testing completion targets in 2023, 2024, and 2025 — highest engagement volume in team history
 - Reduced scheduling lag and friction with internal customers through improved coordination processes and cross-team knowledge management
 - Managed stakeholder communications with VP, Director, and Team Lead stakeholders across application and infrastructure development organizations; served as primary liaison between Offensive Security leadership and business units
 
-### Freelance Consultant — Technical Advisory & Training
-**Independent** | Remote | Mar 2023 – Present (ongoing alongside W2)
+### Owner & Principal Consultant
+**SDK Teck. Consulting** | Independent / Remote | Jan 1992 – Present *(ongoing alongside full-time roles)*
 
-- Technical advisory for multiple organizations on cybersecurity strategy and cloud security management
-- Technical training and education in cybersecurity domains
-- Technical copywriting and editing
+- Independent IT and cybersecurity consulting practice, active on an ongoing basis alongside full-time employment since 1992
+- Cybersecurity strategy and cloud security management advisory for multiple organizations
+- Technical training and education across cybersecurity domains; technical copywriting and editing
+- Earlier engagements (SMB & home clients): network administration, system builds, help-desk support, and end-user training — Active Directory, domain servers, multi-user environments, security, and maintenance
 
 ### Technical Project and Program Manager
 **NCC Group** | Seattle, WA | Jul 2021 – Feb 2023
@@ -57,11 +58,13 @@ Strategic and technically adept IT leader with 25+ years of deep operational exp
 - Managed communications with internal and external stakeholders, tracking milestones, progress, dependencies, and resolutions
 - Authored and maintained technical and non-technical documentation for developers and stakeholders
 
-### Technical PM / Systems Architect and Engineer
-**Lockheed Martin, Leidos, Avanade, TCS, and Mindtree (vendors at Microsoft)** | Redmond, WA | Jul 2012 – Jul 2021
+### Azure Government Cloud — Operations & Security Leadership *(functional summary)*
+**Microsoft vendor contracts: Lockheed Martin, Leidos, Avanade, TCS/IDC Technologies, Mindtree** | Washington, DC area & Redmond, WA | Jul 2012 – Jul 2021
+
+*Roles held (chronological, across vendors): System Administrator → Systems Integration Analyst Sr. / Operations Manager → Project Management & Operations Planning Supervisor → Sr. Consultant → Site Services Technician → Sr Technical Lead*
 
 - Leader and functional manager of a bi-coastal team of network engineers and system administrators
-- Grew team from 10 to 45 engineers; performed HR functions and maintained technical capacity
+- Grew team from 10 to a peak of 60 engineers (45 sustained); performed HR functions and maintained technical capacity
 - 24/7/365 operation building Azure Government infrastructure for Microsoft federal clients
 - Managed NOC build-out and relocation; beta tested new hardware; owned asset and change management processes
 - Incident manager for service outages, crisis management, and security incidents; reported and analyzed SLA and KPI metrics
