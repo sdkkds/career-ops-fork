@@ -1,6 +1,6 @@
 # Azure Government Cloud — proposed responsibility rewrite (2026-07-08)
 
-**Status:** PROPOSED, not yet applied to `cv.md`. Review, then tell Claude "apply it" (with any tweaks).
+**Status:** APPLIED to `cv.md` on 2026-07-26. All 4 open micro-decisions resolved: kept "owned hiring, performance management, and capacity planning" (confirmed accurate); kept "established ... processes" (built them); "runbooks"; clearance merged into the compliance bullet. This file retained for history/comparison only.
 
 **Why the current bullets read dated:** noun-openers ("Incident manager for…"), legacy vocabulary
 ("HR functions," "troubleshooting guides," "beta-tested hardware"), and a hedge-word that leaked in

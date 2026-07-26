@@ -1,27 +1,3 @@
-<!--
-================ REVISION NOTES — cv.md v2 (2026-07-06) · DELETE THIS BLOCK BEFORE USE ================
-Target: corporate Sr. Security Product Owner / Security Program Manager (incl. people-manager). NOT vCISO (separate doc later).
-Prior version preserved as cv-beta.md.
-
-[FILL] — confirm when you can (nothing fabricated in the meantime):
-  [FILL-A] Microsoft block boundary dates: exact end of the 2012–2019 leadership span and exact Mindtree start (2020?).
-  [FILL-B] NCC: contract value / renewal figure for the Fortune-10 program, if shareable (optional; the bullet works without it).
-
-APPLIED THIS PASS:
-  - NCC reframed: leads with owned security-program management driving client contract RETENTION;
-    pre-sales scoping demoted to a self-initiated line; threat-modeling "training" removed (you took it, didn't deliver it).
-  - Microsoft block SPLIT into two dated entries: 2012–2019 team/program leadership (Lockheed/Leidos/Avanade/TCS),
-    and 2020–2021 Sr. Technical Lead (Mindtree) showing lead decisions without formal title. No budget/financial claims.
-  - "Threat modeling" added to Skills (you were trained in it).
-  - Numbers: no real figures available -> kept qualitative; retained your real "100+ engagements"; dropped unverifiable puffery.
-
-JUDGMENT CALLS — still open:
-  - Tenure "30+ years" (true via 1992 practice) vs soften to "20+" for age-screening. Currently 30+.
-  - Education year dropped (2005) for age-proofing — add back if you prefer.
-  - Consulting de-emphasized at end of Experience; "alongside full-time roles" removed.
-=========================================================================================================
--->
-
 # Sunjay D. Kelkar
 
 **Location:** Seattle Metro Area, WA | **Work mode:** Remote (primary since 2020)
@@ -77,24 +53,22 @@ Security Product Ownership | Vulnerability Management | Penetration-Testing Prog
 - Managed stakeholder communications and delivery tracking; authored technical and non-technical documentation
 
 ### Azure Government Cloud — Operations & Security Leadership
-**Microsoft (via Lockheed Martin, Leidos, Avanade, TCS/IDC Technologies)** | Washington, DC area & Redmond, WA | Jul 2012 – Feb 2020 <!-- [FILL-A]: confirm end year -->
+**Microsoft (via Lockheed Martin, Leidos, Avanade, TCS/IDC Technologies)** | Washington, DC area & Redmond, WA | Jul 2012 – Feb 2020
 *Representative titles: Systems Integration Analyst Sr., Operations Manager, PM & Operations Planning Supervisor, Sr. Consultant.*
 
-- Led a bi-coastal team of network engineers and system administrators; accountable to client delivery management (Lockheed/Leidos) and Microsoft leadership for team performance and program delivery
-- Scaled the team from 10 to 45 sustained (60 at peak); performed HR functions and capacity planning
-- Built and operated 24/7/365 Azure Government infrastructure for Microsoft federal clients
-- Led NOC build-out and relocation; owned asset and change-management processes; beta-tested new hardware
-- Incident manager for service outages, crisis management, and security incidents; reported and analyzed SLA/KPI metrics
-- Authored security SOPs, business-continuity plans, training playbooks, and troubleshooting guides
-- Participated in FedRAMP onboarding; operated HIPAA-relevant regulated systems (operational exposure)
-- Held active CJIS/DoD clearance throughout tenure
+- Led a bi-coastal team of infrastructure and systems engineers delivering 24/7/365 Azure Government cloud operations for Microsoft federal clients; accountable to Lockheed/Leidos delivery management and Microsoft leadership for team and program performance
+- Scaled the team from 10 to 45 engineers (60 at peak); owned hiring, performance management, and capacity planning
+- Directed the NOC build-out and relocation; established change-management, asset-lifecycle, and hardware-validation processes
+- Directed incident response for service outages, security incidents, and crisis events; tracked and reported SLA/KPI performance
+- Authored the team's security SOPs, business-continuity plans, runbooks, and training playbooks
+- Supported FedRAMP authorization onboarding; operated within HIPAA- and federally-regulated environments under an active CJIS/DoD clearance
 
 ### Azure Government Cloud — Senior Technical Lead
-**Microsoft (via Mindtree)** | Redmond, WA | Feb 2020 – Jul 2021 <!-- [FILL-A]: confirm Mindtree start date -->
+**Microsoft (via Mindtree)** | Redmond, WA | Feb 2020 – Jul 2021
 *Title: Sr. Technical Lead*
 
-- Made team-lead decisions — technical direction, task allocation, and delivery calls — without formal title authority
-- Continued 24/7/365 Azure Government operations and incident response
+- Served as acting technical lead — set technical direction, allocated work, and owned delivery decisions for the engineering team without formal title authority
+- Sustained 24/7/365 Azure Government operations and incident response
 
 ### Owner & Principal Consultant — SDK Teck Consulting *(independent, part-time)*
 **SDK Teck Consulting** | Remote | 1992 – Present
