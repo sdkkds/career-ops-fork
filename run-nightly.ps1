@@ -2,10 +2,36 @@
 .SYNOPSIS
   Nightly career-ops orchestrator: scan portals -> evaluate new jobs -> write vault output.
 
+.DESCRIPTION
+  Correctness rules this script enforces (see .superpowers/sdd/2026-07-26-career-ops-pipeline-correctness):
+
+    * Report numbers come from reserve-report-num.mjs (atomic, under the tracker
+      lock). They are NEVER derived from filenames.
+    * An eval counts as success only when lib/eval-verify.mjs can prove it from
+      artifacts on disk. A worker printing {"status":"completed"} proves nothing.
+    * Every job gets a two-phase drain marker in data/pipeline.md (in-progress
+      before dispatch, done/failed after the verdict) so the queue actually
+      drains and a crash leaves an accurate record.
+    * Decisions are appended per eval, not flushed at run end, so a mid-run
+      crash loses one line instead of the whole batch.
+    * A scan failure is fatal, and the run reconciles counts before exiting.
+
 .PARAMETER ScanOnly   Run scan only, skip evaluation.
-.PARAMETER EvalOnly   Skip scan; evaluate first -MaxJobs pending items in pipeline.md.
-.PARAMETER MaxJobs    Max new jobs to evaluate per run (default: 10).
-.PARAMETER DryRun     Print what would run without calling claude.
+.PARAMETER EvalOnly   Skip scan; evaluate up to -MaxJobs actionable items in pipeline.md.
+.PARAMETER MaxJobs    Max jobs to evaluate per run (default: 10).
+.PARAMETER DryRun     Print what would run without calling the worker or mutating state.
+
+.NOTES
+  Test-only environment overrides (never set these in the scheduled task):
+    CAREEROPS_WORKER_CMD  Command run instead of `claude` for evaluation. Lets
+                          tests/nightly-smoke.ps1 drive a stub worker so the
+                          forced-failure path can be exercised without spending
+                          money or hitting live job boards.
+    CAREEROPS_VAULT_DIR   Redirects vault output (decisions.jsonl,
+                          morning-review.md) so tests do not pollute the vault.
+    CAREEROPS_ALLOW_SCAN  Required to be '1' before scan will run. See the SCAN
+                          SAFETY GATE block below. This one is a safety
+                          interlock, not a test hook.
 #>
 param(
     [switch]$ScanOnly,
@@ -17,20 +43,32 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Pinned deliberately. When this is $true, any native command exiting non-zero
+# throws under $ErrorActionPreference='Stop' — which would turn eval-verify's
+# intentional exit-1-on-failed-verdict into a run-killing exception and discard
+# the reasons. Every node call below checks $LASTEXITCODE explicitly instead.
+$PSNativeCommandUseErrorActionPreference = $false
+
 # Paths
 $ProjectDir    = "D:\sunja\projects\consulting\career-ops"
-$VaultDir      = "D:\sunja\projects\personal\Fortress of Solitude\career-ops"
+$VaultDir      = if ($env:CAREEROPS_VAULT_DIR) { $env:CAREEROPS_VAULT_DIR }
+                 else { "D:\sunja\projects\personal\Fortress of Solitude\career-ops" }
 $Date          = (Get-Date).ToString("yyyy-MM-dd")
 $RunTimestamp  = (Get-Date).ToString("yyyy-MM-dd HH:mm")
 $LogDir        = "$ProjectDir\batch\logs"
 $ReportsDir    = "$ProjectDir\reports"
+$TsvDir        = "$ProjectDir\batch\tracker-additions"
 $BatchPrompt   = "$ProjectDir\batch\batch-prompt.md"
 $PipelineFile  = "$ProjectDir\data\pipeline.md"
+$NeedsAttnFile = "$ProjectDir\data\needs-attention.md"
 $ScanSysFile   = "$ProjectDir\modes\scan.md"
 $MorningReview = "$VaultDir\morning-review.md"
 $DecisionsLog  = "$VaultDir\decisions.jsonl"
 $LockFile      = "$ProjectDir\batch\.nightly.pid"
 $RunLog        = "$LogDir\nightly-$Date.log"
+
+# Worker command. Defaults to the real thing; overridable only for tests.
+$WorkerCmd     = if ($env:CAREEROPS_WORKER_CMD) { $env:CAREEROPS_WORKER_CMD } else { 'claude' }
 
 # Setup
 New-Item -ItemType Directory -Force -Path $VaultDir | Out-Null
@@ -41,6 +79,21 @@ function Write-Log {
     $line = "[$RunTimestamp] $Msg"
     Write-Host $line -ForegroundColor $Color
     $line | Out-File $RunLog -Encoding utf8 -Append
+}
+
+# Set-StrictMode makes `$obj.missing` a terminating error. Worker-shaped JSON is
+# untrusted and routinely missing fields, so never dot into it directly.
+function Get-Prop {
+    param($Obj, [string]$Name)
+    if ($null -eq $Obj) { return $null }
+    $prop = $Obj.PSObject.Properties[$Name]
+    if ($null -eq $prop) { return $null }
+    return $prop.Value
+}
+
+if ($MaxJobs -lt 1) {
+    Write-Error "-MaxJobs must be at least 1 (got $MaxJobs)."
+    exit 1
 }
 
 # Lock
@@ -56,26 +109,11 @@ if (Test-Path $LockFile) {
 }
 $PID | Out-File $LockFile -Encoding utf8
 
+# Every node helper below is invoked with a repo-relative script path, so the
+# whole run must happen with the project as the working directory.
+Push-Location $ProjectDir
+
 try {
-
-# Track highest report number across current run to avoid duplicates
-$script:RunMaxReport = -1
-
-function Get-NextReportNum {
-    if ($script:RunMaxReport -lt 0) {
-        $script:RunMaxReport = 0
-        if (Test-Path $ReportsDir) {
-            Get-ChildItem $ReportsDir -Filter "*.md" | ForEach-Object {
-                if ($_.Name -match '^(\d+)') {
-                    $n = [int]$Matches[1]
-                    if ($n -gt $script:RunMaxReport) { $script:RunMaxReport = $n }
-                }
-            }
-        }
-    }
-    $script:RunMaxReport++
-    return $script:RunMaxReport.ToString("000")
-}
 
 function Resolve-BatchPrompt {
     param([string]$Url, [string]$JdFile, [string]$ReportNum, [string]$Dt, [string]$Id)
@@ -88,32 +126,38 @@ function Resolve-BatchPrompt {
     return $c
 }
 
-function Parse-JobLine {
-    param([string]$Line)
-    $raw   = $Line -replace '^\- \[ \] ', ''
-    $parts = $raw -split ' \| ', 3
-    return [PSCustomObject]@{
-        Url     = $parts[0].Trim()
-        Company = if ($parts.Count -gt 1) { $parts[1].Trim() } else { 'Unknown' }
-        Title   = if ($parts.Count -gt 2) { $parts[2].Trim() } else { 'Unknown Role' }
+# Two-phase drain marker. A failure here means the queue and the run have
+# diverged (the URL we dispatched is not the URL in the file) — that is never
+# something to warn past, so it aborts the run.
+function Set-PipelineState {
+    param([string]$Url, [string]$State, [int]$Attempts = -1)
+    if ($Attempts -ge 0) {
+        & node lib/pipeline-state.mjs --file $PipelineFile --url $Url --state $State --attempts $Attempts | Out-Null
+    } else {
+        & node lib/pipeline-state.mjs --file $PipelineFile --url $Url --state $State | Out-Null
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Log "FATAL: could not mark '$Url' as '$State' in $PipelineFile (exit $LASTEXITCODE). The queue and this run have diverged." 'Red'
+        exit 1
     }
 }
 
-function Extract-JsonResult {
-    param([string]$LogContent)
-    # Worker prints a JSON block at the end of stdout (batch-prompt.md Paso 6)
-    $lastOpen  = $LogContent.LastIndexOf('{')
-    $lastClose = $LogContent.LastIndexOf('}')
-    if ($lastOpen -ne -1 -and $lastClose -gt $lastOpen) {
-        $jsonStr = $LogContent.Substring($lastOpen, $lastClose - $lastOpen + 1)
-        try { return $jsonStr | ConvertFrom-Json } catch {}
+function Add-NeedsAttention {
+    param([string]$Url, [string]$Stage, [string]$Reason)
+    # Passed via env var rather than inline in the -e string: reasons contain
+    # quotes, semicolons and URLs, and PowerShell->node quoting mangles them.
+    $env:CAREEROPS_NA_JSON = (@{ url = $Url; stage = $Stage; reason = $Reason; at = $RunTimestamp } | ConvertTo-Json -Compress)
+    try {
+        & node -e "import('./lib/needs-attention.mjs').then(m => m.appendNeedsAttention(process.argv[1], JSON.parse(process.env.CAREEROPS_NA_JSON)))" $NeedsAttnFile | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "ERROR: failed to record needs-attention row for $Url (exit $LASTEXITCODE)." 'Red'
+        }
+    } finally {
+        Remove-Item Env:\CAREEROPS_NA_JSON -ErrorAction SilentlyContinue
     }
-    return $null
 }
 
 # ---- SCAN ----
-
-$newLines = @()
 
 if (-not $EvalOnly) {
     Write-Log "=== SCAN phase ===" 'Cyan'
@@ -128,69 +172,66 @@ if (-not $EvalOnly) {
         Write-Log "[DRY RUN] Would run: claude --print (scan)" 'Yellow'
     } else {
         $scanMsg = "Today is $Date. Project directory: $ProjectDir. Execute the full portal scan as described in your system instructions. Report how many new jobs were added to data/pipeline.md."
-        Push-Location $ProjectDir
-        try {
-            # ==================== SCAN SAFETY GATE + SCOPING (P0, 2026-07-03) ====================
-            # SCAN drives the Playwright MCP over UNTRUSTED job portals. It previously ran
-            # --dangerously-skip-permissions (full tool access - the P0). Two changes:
-            #
-            #   1. INTERLOCK: scan REFUSES to run unless CAREEROPS_ALLOW_SCAN=1 is set explicitly.
-            #      This is defense-in-depth on top of the scheduled task being Disabled: two
-            #      independent locks (task Disabled AND this gate) instead of relying on one.
-            #      Re-enabling the task alone will NOT fire a scan.
-            #
-            #   2. SCOPED command (pre-staged, ACTIVE below): replaces skip-permissions with an
-            #      allowlist + dontAsk, no Bash. UNVERIFIED HEADLESS - the dontAsk / project-MCP
-            #      trust behavior for the Playwright MCP has not been tested end-to-end. The
-            #      --dangerously-skip-permissions fallback is kept commented out below.
-            #
-            # REACTIVATION CHECKLIST (do these when you resume career-ops for real usage):
-            #   [ ] $env:CAREEROPS_ALLOW_SCAN = '1'
-            #   [ ] run: .\run-nightly.ps1 -ScanOnly   (watch for MCP permission prompts / hangs)
-            #   [ ] confirm new jobs land in data/pipeline.md and no unexpected tool calls occur
-            #   [ ] once verified, DELETE the commented skip-permissions fallback block below
-            #   [ ] bundle with the correctness-spec rewrite (tracker frozen / drain / filter leak)
-            # Tracking: wiki/meta/2026-07-03-portfolio-fix-matrix.md (career-ops P0).
-            # ====================================================================================
-            if ($env:CAREEROPS_ALLOW_SCAN -ne '1') {
-                throw "SCAN blocked: unverified headless scan path (P0 residual). Set CAREEROPS_ALLOW_SCAN=1 to run scan, after reading the SCAN SAFETY GATE in run-nightly.ps1."
-            }
-
-            # --- Scoped scan (pre-staged; VERIFY headless before trusting) ---
-            & claude --print `
-                --allowedTools "Read,Write,Edit,WebFetch,WebSearch,mcp__playwright" `
-                --permission-mode dontAsk `
-                --append-system-prompt-file $ScanSysFile `
-                $scanMsg `
-                | Out-File $scanLog -Encoding utf8
-            $scanExit = $LASTEXITCODE
-
-            # --- FALLBACK: full tool access over UNTRUSTED portals. UNSAFE. Do NOT uncomment
-            #     unless the scoped command above fails AND you accept the risk. Delete once the
-            #     scoped scan is verified working headless. ---
-            # & claude --print `
-            #     --dangerously-skip-permissions `
-            #     --append-system-prompt-file $ScanSysFile `
-            #     $scanMsg `
-            #     | Out-File $scanLog -Encoding utf8
-            # $scanExit = $LASTEXITCODE
-        } finally {
-            Pop-Location
+        # ==================== SCAN SAFETY GATE + SCOPING (P0, 2026-07-03) ====================
+        # SCAN drives the Playwright MCP over UNTRUSTED job portals. It previously ran
+        # --dangerously-skip-permissions (full tool access - the P0). Two changes:
+        #
+        #   1. INTERLOCK: scan REFUSES to run unless CAREEROPS_ALLOW_SCAN=1 is set explicitly.
+        #      This is defense-in-depth on top of the scheduled task being Disabled: two
+        #      independent locks (task Disabled AND this gate) instead of relying on one.
+        #      Re-enabling the task alone will NOT fire a scan.
+        #
+        #   2. SCOPED command (pre-staged, ACTIVE below): replaces skip-permissions with an
+        #      allowlist + dontAsk, no Bash. UNVERIFIED HEADLESS - the dontAsk / project-MCP
+        #      trust behavior for the Playwright MCP has not been tested end-to-end. The
+        #      --dangerously-skip-permissions fallback is kept commented out below.
+        #
+        # REACTIVATION CHECKLIST (do these when you resume career-ops for real usage):
+        #   [ ] $env:CAREEROPS_ALLOW_SCAN = '1'
+        #   [ ] run: .\run-nightly.ps1 -ScanOnly   (watch for MCP permission prompts / hangs)
+        #   [ ] confirm new jobs land in data/pipeline.md and no unexpected tool calls occur
+        #   [ ] once verified, DELETE the commented skip-permissions fallback block below
+        #   [ ] bundle with the correctness-spec rewrite (tracker frozen / drain / filter leak)
+        # Tracking: wiki/meta/2026-07-03-portfolio-fix-matrix.md (career-ops P0).
+        # ====================================================================================
+        if ($env:CAREEROPS_ALLOW_SCAN -ne '1') {
+            throw "SCAN blocked: unverified headless scan path (P0 residual). Set CAREEROPS_ALLOW_SCAN=1 to run scan, after reading the SCAN SAFETY GATE in run-nightly.ps1."
         }
+
+        # --- Scoped scan (pre-staged; VERIFY headless before trusting) ---
+        & claude --print `
+            --allowedTools "Read,Write,Edit,WebFetch,WebSearch,mcp__playwright" `
+            --permission-mode dontAsk `
+            --append-system-prompt-file $ScanSysFile `
+            $scanMsg `
+            | Out-File $scanLog -Encoding utf8
+        $scanExit = $LASTEXITCODE
+
+        # --- FALLBACK: full tool access over UNTRUSTED portals. UNSAFE. Do NOT uncomment
+        #     unless the scoped command above fails AND you accept the risk. Delete once the
+        #     scoped scan is verified working headless. ---
+        # & claude --print `
+        #     --dangerously-skip-permissions `
+        #     --append-system-prompt-file $ScanSysFile `
+        #     $scanMsg `
+        #     | Out-File $scanLog -Encoding utf8
+        # $scanExit = $LASTEXITCODE
+
+        # A failed scan means the queue is not what this run assumes it is.
+        # Continuing would evaluate a stale pipeline and report success.
         if ($scanExit -ne 0) {
-            Write-Log "WARN: Scan exited $scanExit. See $scanLog" 'Yellow'
-        } else {
-            Write-Log "Scan complete. Log: $scanLog" 'Green'
+            Write-Log "FATAL: scan exited $scanExit. See $scanLog" 'Red'
+            Add-NeedsAttention -Url '(scan)' -Stage 'scan' -Reason "scan exited $scanExit; see $scanLog"
+            exit 1
         }
+        Write-Log "Scan complete. Log: $scanLog" 'Green'
     }
 
     $after = @()
     if (Test-Path $PipelineFile) {
         $after = @((Get-Content $PipelineFile -Encoding utf8) | Where-Object { $_ -match '^\- \[ \]' })
     }
-
-    $newLines = @($after | Where-Object { $before -notcontains $_ })
-    Write-Log "$($newLines.Count) new job(s) added by scan."
+    Write-Log "$(@($after | Where-Object { $before -notcontains $_ }).Count) new job(s) added by scan."
 }
 
 if ($ScanOnly) {
@@ -198,105 +239,215 @@ if ($ScanOnly) {
     exit 0
 }
 
-if ($EvalOnly) {
-    if (Test-Path $PipelineFile) {
-        $allPending = @((Get-Content $PipelineFile -Encoding utf8) | Where-Object { $_ -match '^\- \[ \]' })
-        $newLines   = @($allPending | Select-Object -First $MaxJobs)
+# ---- SELECT WORK ----
+#
+# The actionable list is state-aware: pending rows plus failed rows still inside
+# the retry budget, and never rows already done / in-progress / expired. Rows are
+# parsed by lib/pipeline-state.mjs, never by PowerShell string splitting — they
+# carry 1/3/4/5 positional columns plus labeled `posted:` / `trust:` / `note:`
+# segments that naive splitting gets wrong.
+
+# Reap rows stranded in-progress by a previous crashed run. listActionable skips
+# in-progress deliberately (it means "a run owns this"), so without this step a
+# crash between the two marker writes would park the job forever. The PID lock
+# above guarantees no other run owns them right now.
+$staleJson = & node lib/pipeline-state.mjs --file $PipelineFile --list --state in-progress
+if ($LASTEXITCODE -ne 0) {
+    Write-Log "FATAL: could not list in-progress jobs from $PipelineFile (exit $LASTEXITCODE)." 'Red'
+    exit 1
+}
+foreach ($stale in @(($staleJson | Out-String) | ConvertFrom-Json)) {
+    if ($DryRun) {
+        Write-Log "  [DRY RUN] Would recover job stranded in-progress: $($stale.url)" 'Yellow'
+        continue
     }
-    Write-Log "EvalOnly: $($newLines.Count) pending job(s) to evaluate."
+    Write-Log "Recovering job stranded in-progress by an earlier run: $($stale.url)" 'Yellow'
+    Set-PipelineState -Url $stale.url -State 'failed' -Attempts ([int]$stale.attempts + 1)
+    Add-NeedsAttention -Url $stale.url -Stage 'crash-recovery' -Reason 'left in-progress by a run that did not finish'
 }
 
-if ($newLines.Count -gt $MaxJobs) {
-    Write-Log "Capping at $MaxJobs (of $($newLines.Count) new)."
-    $newLines = @($newLines | Select-Object -First $MaxJobs)
+$listJson = & node lib/pipeline-state.mjs --file $PipelineFile --list --limit $MaxJobs
+if ($LASTEXITCODE -ne 0) {
+    Write-Log "FATAL: could not list actionable jobs from $PipelineFile (exit $LASTEXITCODE)." 'Red'
+    exit 1
 }
+$jobs = @(($listJson | Out-String) | ConvertFrom-Json)
+Write-Log "$($jobs.Count) actionable job(s) (pending + retryable failures)."
 
 # ---- EVALUATE ----
 
 $results = [System.Collections.Generic.List[PSObject]]::new()
 
-Write-Log "=== EVALUATE phase ($($newLines.Count) jobs) ===" 'Cyan'
+# Reconciliation baseline: decisions.jsonl is append-only, so the delta over the
+# run is exact. Comparing the running total instead would pass trivially.
+$decisionsBefore = if (Test-Path $DecisionsLog) { @(Get-Content $DecisionsLog).Count } else { 0 }
+
+Write-Log "=== EVALUATE phase ($($jobs.Count) jobs) ===" 'Cyan'
 
 $idx = 0
-foreach ($line in $newLines) {
+foreach ($job in $jobs) {
     $idx++
-    $job       = Parse-JobLine $line
-    $reportNum = Get-NextReportNum
-    $id        = "nightly-$Date-$idx"
-    $jdFile    = "$ProjectDir\jds\not-pre-downloaded.md"
+    $jobUrl = $job.url
+    $id     = "nightly-$Date-$idx"
+    $jdFile = "$ProjectDir\jds\not-pre-downloaded.md"
+
+    Write-Log "  [$idx/$($jobs.Count)] $($job.company) - $($job.title)  ($jobUrl)"
+
+    if ($DryRun) {
+        Write-Log "  [DRY RUN] Would evaluate: $jobUrl" 'Yellow'
+        continue
+    }
+
+    # Race-safe: reserve-report-num.mjs claims the number under the tracker lock
+    # with O_CREAT|O_EXCL, so parallel workers cannot collide and overwrite each
+    # other's report files. Never derive the number from filenames.
+    # It prints a bare zero-padded id ("042\n") on stdout — not JSON — and drops
+    # a reports/NNN-RESERVED.md sentinel that we must release below.
+    $reportNum = (& node reserve-report-num.mjs | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $reportNum -notmatch '^\d{3,}$') {
+        Write-Log "FATAL: could not reserve a report number (exit $LASTEXITCODE, output '$reportNum')." 'Red'
+        exit 1
+    }
 
     $resolvedPath = "$ProjectDir\batch\.resolved-nightly-$idx.md"
     $logFile      = "$LogDir\$reportNum-nightly-$idx.log"
 
-    Write-Log "  [$idx/$($newLines.Count)] $($job.Company) - $($job.Title)  (report $reportNum)"
+    # Phase 1 of the drain marker: recorded BEFORE dispatch, so a crash mid-eval
+    # leaves the row as in-progress rather than looking pending forever.
+    Set-PipelineState -Url $jobUrl -State 'in-progress'
 
-    if ($DryRun) {
-        Write-Log "  [DRY RUN] Would evaluate: $($job.Url)" 'Yellow'
-        continue
-    }
-
-    $resolved = Resolve-BatchPrompt $job.Url $jdFile $reportNum $Date $id
-    $resolved | Out-File $resolvedPath -Encoding utf8
-
-    $userMsg = "Procesa esta oferta de empleo. Ejecuta el pipeline completo: evaluacion A-G + report .md + PDF + tracker line. URL: $($job.Url) JD file: $jdFile Report number: $reportNum Date: $Date Batch ID: $id"
-
-    Push-Location $ProjectDir
+    $r = $null
     try {
-        & claude --print `
+        $resolved = Resolve-BatchPrompt $jobUrl $jdFile $reportNum $Date $id
+        $resolved | Out-File $resolvedPath -Encoding utf8
+
+        $userMsg = "Procesa esta oferta de empleo. Ejecuta el pipeline completo: evaluacion A-G + report .md + PDF + tracker line. URL: $jobUrl JD file: $jdFile Report number: $reportNum Date: $Date Batch ID: $id"
+
+        & $WorkerCmd --print `
             --allowedTools "Read,Write,Glob,Grep,WebFetch,WebSearch,Bash(node generate-pdf.mjs *)" `
             --permission-mode dontAsk `
             --append-system-prompt-file $resolvedPath `
             $userMsg `
             | Out-File $logFile -Encoding utf8
         $evalExit = $LASTEXITCODE
-    } finally {
-        Pop-Location
-    }
 
-    Remove-Item $resolvedPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $resolvedPath -Force -ErrorAction SilentlyContinue
 
-    $logContent = if (Test-Path $logFile) { Get-Content $logFile -Raw -Encoding utf8 } else { '' }
-    $parsed     = Extract-JsonResult $logContent
-
-    if ($null -ne $parsed) {
-        $r = $parsed
-    } else {
-        $errMsg = if ($evalExit -ne 0) { "exit $evalExit - JSON not found in output" } else { $null }
-        $r = [PSCustomObject]@{
-            status     = if ($evalExit -eq 0) { 'completed' } else { 'failed' }
-            id         = $id
-            report_num = $reportNum
-            company    = $job.Company
-            role       = $job.Title
-            score      = $null
-            legitimacy = $null
-            pdf        = $null
-            report     = $null
-            error      = $errMsg
+        # Bind verification to the number we reserved. The worker chooses the
+        # company slug, so we discover the report by its reserved-number prefix
+        # rather than trusting a path the worker reports. A report written under
+        # any other number is not found, and the eval fails closed.
+        $found = @(Get-ChildItem $ReportsDir -Filter "$reportNum-*.md" -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -ne "$reportNum-RESERVED.md" })
+        if ($found.Count -gt 0) {
+            $reportRel = "reports/$($found[0].Name)"
+        } else {
+            $slug = ($job.company -replace '[^a-zA-Z0-9]+', '-').Trim('-').ToLower()
+            if (-not $slug) { $slug = 'unknown' }
+            $reportRel = "reports/$reportNum-$slug-$Date.md"   # expected path, for the failure message
         }
+        $tsvRel = "batch/tracker-additions/$reportNum-$id.tsv"
+
+        # The success definition lives in lib/eval-verify.mjs and is enforced
+        # against files on disk. It also owns the sentinel parsing — this script
+        # must never look for the sentinel strings itself.
+        $verdict = $null
+        $verdictRaw = ''
+        try {
+            $verdictRaw = (& node lib/eval-verify.mjs `
+                --log $logFile --root $ProjectDir `
+                --report $reportRel --tsv $tsvRel --url $jobUrl | Out-String)
+            $verdict = $verdictRaw | ConvertFrom-Json
+        } catch {
+            $verdict = $null
+        }
+
+        if ($null -eq $verdict) {
+            # Verifier itself failed. Fail closed and keep going; the run still
+            # exits non-zero via the unverified-eval gate below.
+            $status  = 'failed'
+            $reasons = "eval-verify produced no usable verdict (worker exit $evalExit): $($verdictRaw.Trim())"
+            $value   = $null
+        } else {
+            $status  = Get-Prop $verdict 'status'
+            $value   = Get-Prop $verdict 'value'
+            $rs      = Get-Prop $verdict 'reasons'
+            $reasons = if ($rs) { ($rs -join '; ') } else { $null }
+        }
+
+        $r = [PSCustomObject]@{
+            status       = $status
+            id           = $id
+            report_num   = $reportNum
+            url          = $jobUrl
+            company      = if ($value) { Get-Prop $value 'company' }    else { $job.company }
+            role         = if ($value) { Get-Prop $value 'role' }       else { $job.title }
+            score        = if ($value) { Get-Prop $value 'score' }      else { $null }
+            legitimacy   = if ($value) { Get-Prop $value 'legitimacy' } else { $null }
+            pdf          = if ($value) { Get-Prop $value 'pdf' }        else { $null }
+            report       = if ($found.Count -gt 0) { $reportRel } else { $null }
+            error        = $reasons
+            evaluated_at = $RunTimestamp
+        }
+
+    } catch {
+        # An orchestrator-side error (worker binary missing, disk full, bad
+        # prompt template) must still produce a verdict. Otherwise the row stays
+        # in-progress and the job is stranded until the reaper above finds it.
+        $r = [PSCustomObject]@{
+            status       = 'failed'
+            id           = $id
+            report_num   = $reportNum
+            url          = $jobUrl
+            company      = $job.company
+            role         = $job.title
+            score        = $null
+            legitimacy   = $null
+            pdf          = $null
+            report       = $null
+            error        = "orchestrator error during eval: $($_.Exception.Message)"
+            evaluated_at = $RunTimestamp
+        }
+    } finally {
+        # Always drop the reservation sentinel. On success the real report file
+        # now occupies the number; on failure the number is free to reuse.
+        & node reserve-report-num.mjs --release $reportNum | Out-Null
+        Remove-Item $resolvedPath -Force -ErrorAction SilentlyContinue
     }
 
-    $r | Add-Member -NotePropertyName url          -NotePropertyValue $job.Url      -Force
-    $r | Add-Member -NotePropertyName evaluated_at -NotePropertyValue $RunTimestamp -Force
-
+    # Single tail for both the verdict path and the orchestrator-error path, so
+    # "every dispatched job is recorded and re-marked exactly once" is one code
+    # path rather than an invariant duplicated across branches.
     $results.Add($r)
+
+    # Append per eval: a mid-run crash then loses one line, not the whole batch.
+    ($r | ConvertTo-Json -Compress -Depth 5) | Out-File $DecisionsLog -Encoding utf8 -Append
+
+    # Phase 2 of the drain marker. `attempts` is threaded from the listing in
+    # memory and incremented here. Re-reading it from the file after the
+    # in-progress write is the trap that silently resets the retry budget.
+    if ($r.status -eq 'completed') {
+        Set-PipelineState -Url $jobUrl -State 'done'
+    } else {
+        Set-PipelineState -Url $jobUrl -State 'failed' -Attempts ([int]$job.attempts + 1)
+        Add-NeedsAttention -Url $jobUrl -Stage 'eval' -Reason $r.error
+    }
 
     $statusTag = if ($r.status -eq 'completed') { 'OK  ' } else { 'FAIL' }
     $scoreTag  = if ($null -ne $r.score) { "$($r.score)/5" } else { '?' }
     Write-Log "    $statusTag  score=$scoreTag  log=$logFile"
+    if ($r.status -ne 'completed') { Write-Log "          reason: $($r.error)" 'Yellow' }
 }
 
 # ---- VAULT OUTPUT ----
 
 Write-Log "=== VAULT OUTPUT ===" 'Cyan'
 
-if ($results.Count -eq 0 -and -not $DryRun) {
+if ($DryRun) {
+    Write-Log "[DRY RUN] Skipping vault output."
+} elseif ($results.Count -eq 0) {
     Write-Log "No results to write."
 } else {
-
-    foreach ($r in $results) {
-        ($r | ConvertTo-Json -Compress -Depth 5) | Out-File $DecisionsLog -Encoding utf8 -Append
-    }
     Write-Log "decisions.jsonl: +$($results.Count) entries -> $DecisionsLog" 'Green'
 
     $top5 = @($results |
@@ -306,17 +457,17 @@ if ($results.Count -eq 0 -and -not $DryRun) {
 
     $md  = "# Morning Review - $RunTimestamp`n`n"
     $md += "$($top5.Count) top result(s) from last night's scan"
-    if ($results.Count -gt 0) { $md += " (evaluated $($results.Count))" }
+    $md += " (evaluated $($results.Count))"
     $md += ".`n`n---`n`n"
 
     $rank = 0
-    foreach ($r in $top5) {
+    foreach ($t in $top5) {
         $rank++
-        $legPart    = if ($r.legitimacy) { " - $($r.legitimacy)" } else { '' }
-        $reportPart = if ($r.report)     { " - [Report]($($r.report))" } else { '' }
-        $md += "## $rank. $($r.company) - $($r.role)`n`n"
-        $md += "**Score:** $($r.score)/5$legPart$reportPart`n"
-        $md += "**URL:** $($r.url)`n`n---`n`n"
+        $legPart    = if ($t.legitimacy) { " - $($t.legitimacy)" } else { '' }
+        $reportPart = if ($t.report)     { " - [Report]($($t.report))" } else { '' }
+        $md += "## $rank. $($t.company) - $($t.role)`n`n"
+        $md += "**Score:** $($t.score)/5$legPart$reportPart`n"
+        $md += "**URL:** $($t.url)`n`n---`n`n"
     }
 
     if ($top5.Count -eq 0) {
@@ -327,8 +478,59 @@ if ($results.Count -eq 0 -and -not $DryRun) {
     Write-Log "Morning review -> $MorningReview" 'Green'
 }
 
-} finally {
-    Remove-Item $LockFile -Force -ErrorAction SilentlyContinue
+# ---- COUNT RECONCILIATION ----
+#
+# "Works once" is not done: a batch job ends by proving processed == expected.
+# A gap here is a failure, not a footnote.
+
+$evaluated = $results.Count
+$completed = @($results | Where-Object { $_.status -eq 'completed' }).Count
+$reportsNow = @(Get-ChildItem $ReportsDir -Filter '*.md' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notlike '*-RESERVED.md' }).Count
+$tsvsNow = @(Get-ChildItem $TsvDir -Filter '*.tsv' -ErrorAction SilentlyContinue).Count
+$decisionsNow = if (Test-Path $DecisionsLog) { @(Get-Content $DecisionsLog).Count } else { 0 }
+$decisionsAdded = $decisionsNow - $decisionsBefore
+
+Write-Log "RECONCILE evaluated=$evaluated completed=$completed decisions_added=$decisionsAdded tsvs_pending=$tsvsNow reports_total=$reportsNow decisions_total=$decisionsNow"
+
+if ($DryRun) {
+    Write-Log "[DRY RUN] Skipping merge/verify."
+    Write-Log "=== Done ===" 'Green'
+    exit 0
+}
+
+if ($decisionsAdded -lt $evaluated) {
+    Write-Log "FATAL: $evaluated evals but only $decisionsAdded decision line(s) appended — decisions were lost." 'Red'
+    exit 1
+}
+if ($tsvsNow -lt $completed) {
+    Write-Log "FATAL: $completed completed eval(s) but only $tsvsNow TSV(s) — tracker rows will be missing." 'Red'
+    exit 1
+}
+
+& node merge-tracker.mjs
+if ($LASTEXITCODE -ne 0) { Write-Log "FATAL: merge-tracker failed." 'Red'; exit 1 }
+
+& node verify-pipeline.mjs
+$verifyExit = $LASTEXITCODE
+if ($verifyExit -ne 0) {
+    Write-Log "verify-pipeline reported errors — see data/needs-attention.md" 'Red'
+    Add-NeedsAttention -Url '(pipeline)' -Stage 'verify-pipeline' -Reason "verify-pipeline exit=$verifyExit"
+    exit 1
+}
+
+# Reconciliation passed and the tracker merged, but an unverified eval must
+# never let the run report success.
+$unverified = $evaluated - $completed
+if ($unverified -gt 0) {
+    Write-Log "FAIL: $unverified of $evaluated eval(s) could not be verified — see $NeedsAttnFile" 'Red'
+    exit 1
 }
 
 Write-Log "=== Done ===" 'Green'
+exit 0
+
+} finally {
+    Pop-Location
+    Remove-Item $LockFile -Force -ErrorAction SilentlyContinue
+}

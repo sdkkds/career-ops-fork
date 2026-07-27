@@ -222,6 +222,79 @@ test('irregular spacing: extra spaces after bracket are tolerated', () => {
   assert.equal(gamma.company, 'Gamma');
 });
 
+// --- CRLF line endings ---
+//
+// data/pipeline.md is written by whatever touched it last. node writes LF, but
+// PowerShell's Add-Content/Out-File/Set-Content and every Windows editor write
+// CRLF. A row the parser cannot see is a job that is never listed, never
+// dispatched, and never drained — it just vanishes. That is exactly the silent
+// class of failure this module exists to prevent, so CRLF must round-trip.
+
+const TEXT_CRLF = TEXT_REAL_SHAPES.split('\n').join('\r\n');
+
+// One LF file with a single CRLF row appended, as Add-Content would leave it.
+const TEXT_MIXED_EOL = TEXT.replace(
+  '- [ ] https://x.test/j/1 | Acme | PM',
+  '- [ ] https://x.test/j/1 | Acme | PM\r',
+);
+
+test('CRLF rows parse — a Windows-written row must not be invisible', () => {
+  const entries = parsePipeline(TEXT_CRLF);
+  assert.equal(entries.length, 4, 'all four CRLF rows are seen');
+  assert.equal(entries[0].url, 'https://jobs.ashbyhq.com/acme/791');
+});
+
+test('CRLF rows expose no stray carriage return in parsed fields', () => {
+  const entries = parsePipeline(TEXT_CRLF);
+  const lever = entries.find(e => e.url.includes('lever'));
+  assert.equal(lever.company, 'Foo Inc');
+  assert.equal(lever.title, 'PM');
+  assert.equal(lever.url.includes('\r'), false, 'url must not carry the CR');
+  assert.equal(lever.remainder.includes('\r'), false, 'remainder must not carry the CR');
+});
+
+test('CRLF row attempts are read off the trailing comment', () => {
+  const failed = parsePipeline(TEXT_CRLF).find(e => e.state === 'failed');
+  assert.ok(failed, 'finds the failed CRLF row');
+  assert.equal(failed.attempts, 1);
+});
+
+test('setState preserves the CRLF ending it found', () => {
+  const next = setState(TEXT_CRLF, 'https://jobs.ashbyhq.com/acme/791', 'in-progress');
+  assert.ok(
+    next.includes('- [~] https://jobs.ashbyhq.com/acme/791 | Acme Corp | Staff PM | note: curated shortlist\r\n'),
+    'rewritten row keeps its CRLF terminator and its labeled segments',
+  );
+  assert.equal(next.split('\r\n').length, TEXT_CRLF.split('\r\n').length, 'no lines gained or lost');
+});
+
+test('setState on a CRLF row puts the attempts comment before the CR, not after it', () => {
+  const next = setState(TEXT_CRLF, 'https://x.test/j/999', 'failed', { attempts: 2 });
+  assert.ok(
+    next.includes('- [!] https://x.test/j/999 | Beta | TPM | trust: 85 stale <!-- attempts:2 -->\r\n'),
+    'comment sits at end of text, CR still terminates the line',
+  );
+  // And it must survive a re-parse, which is what the orchestrator actually relies on.
+  const reparsed = parsePipeline(next).find(e => e.url === 'https://x.test/j/999');
+  assert.equal(reparsed.attempts, 2);
+  assert.equal(reparsed.state, 'failed');
+});
+
+test('listActionable finds CRLF rows', () => {
+  const urls = listActionable(TEXT_CRLF, { limit: 10, maxAttempts: RETRY_BUDGET }).map(e => e.url);
+  assert.equal(urls.length, 4);
+  assert(urls.includes('https://x.test/j/999'));
+});
+
+test('mixed LF and CRLF rows in one file both parse and round-trip', () => {
+  const entries = parsePipeline(TEXT_MIXED_EOL);
+  assert.equal(entries.length, 5, 'the CRLF row and the LF rows are all seen');
+
+  const next = setState(TEXT_MIXED_EOL, 'https://x.test/j/1', 'done');
+  assert.ok(next.includes('- [x] https://x.test/j/1 | Acme | PM\r\n'), 'CRLF row keeps CRLF');
+  assert.ok(next.includes('- [x] https://x.test/j/3 | Gamma | PO\n'), 'LF rows keep LF');
+});
+
 test('listActionable returns real-shape entries that parse correctly', () => {
   const actionable = listActionable(TEXT_REAL_SHAPES, { limit: 10, maxAttempts: RETRY_BUDGET });
   const urls = actionable.map(e => e.url);
