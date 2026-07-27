@@ -151,6 +151,22 @@ function parseArgs(argv) {
   return out;
 }
 
+/**
+ * needs-attention is a SIDE-CHANNEL record, never the outcome itself. An
+ * unwritable data/needs-attention.md (permission error, missing dir, disk full)
+ * must not replace a deliberate `process.exit(1)` — or, worse, a deliberate
+ * exit-0 path — with an uncaught stack trace whose exit code and message say
+ * nothing about what digest actually did. Fail loud on stderr, keep the
+ * intended control flow. Same convention as merge-tracker.mjs.
+ */
+function recordNeedsAttention(file, row) {
+  try {
+    appendNeedsAttention(file, row);
+  } catch (err) {
+    console.error(`digest: failed to write needs-attention row to '${file}' (${err.message}) — continuing`);
+  }
+}
+
 if (process.argv[1] && basename(process.argv[1]) === 'digest.mjs') {
   const { file, needsAttention, cursor, since: sinceFallback } = parseArgs(process.argv.slice(2));
 
@@ -169,7 +185,7 @@ if (process.argv[1] && basename(process.argv[1]) === 'digest.mjs') {
     console.log(`HEARTBEAT ${JSON.stringify(heartbeat)}`);
     const reason = `digest could not read decisions file '${file}': ${err.message}`;
     console.error(reason);
-    appendNeedsAttention(needsAttention, {
+    recordNeedsAttention(needsAttention, {
       url: '', stage: 'digest-read', reason, at: new Date().toISOString(),
     });
     process.exit(1);
@@ -190,7 +206,7 @@ if (process.argv[1] && basename(process.argv[1]) === 'digest.mjs') {
     const reason = `digest cursor '${cursor}' exists but is unreadable/corrupt; ` +
       `falling back to an unfiltered window to avoid silently dropping pending decisions`;
     console.error(reason);
-    appendNeedsAttention(needsAttention, {
+    recordNeedsAttention(needsAttention, {
       url: '', stage: 'digest-cursor', reason, at: new Date().toISOString(),
     });
   } else if (cursorState.since) {
@@ -225,7 +241,7 @@ if (process.argv[1] && basename(process.argv[1]) === 'digest.mjs') {
       const reason = `digest could not advance cursor '${cursor}' to '${heartbeat.newestEvaluatedAt}': ` +
         `${err.message} (next run will conservatively re-include already-digested results rather than silently dropping pending ones)`;
       console.error(reason);
-      appendNeedsAttention(needsAttention, {
+      recordNeedsAttention(needsAttention, {
         url: '', stage: 'digest-cursor-write', reason, at: new Date().toISOString(),
       });
     }
@@ -270,7 +286,7 @@ if (process.argv[1] && basename(process.argv[1]) === 'digest.mjs') {
   } catch (err) {
     const reason = `digest send failed: ${err.message}`;
     console.error(reason);
-    appendNeedsAttention(needsAttention, {
+    recordNeedsAttention(needsAttention, {
       url: '', stage: 'digest-send', reason, at: new Date().toISOString(),
     });
     // Cursor is deliberately NOT advanced here — these results must be

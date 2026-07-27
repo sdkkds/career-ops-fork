@@ -442,8 +442,17 @@ Design rules:
 Write exactly one TSV line to:
 
 ```text
-batch/tracker-additions/{{ID}}.tsv
+batch/tracker-additions/{{REPORT_NUM}}-{{ID}}.tsv
 ```
+
+**This exact path is the contract.** The orchestrator verifies the eval by
+checking for a file at `batch/tracker-additions/{{REPORT_NUM}}-{{ID}}.tsv` on
+disk (`lib/eval-verify.mjs`). A TSV written anywhere else — including
+`batch/tracker-additions/{{ID}}.tsv` without the report-number prefix — makes
+the evaluation fail verification even though the work was done, and the job is
+retried on following nights at full cost. `tests/contract-drift.test.mjs`
+asserts this path stays identical here, in `run-nightly.ps1`, and in the smoke
+stub.
 
 Format, no header, 10 tab-separated columns:
 

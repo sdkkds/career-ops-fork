@@ -113,6 +113,7 @@ them as hints when triaging; none changes how you process the URL.
 - **LinkedIn**: May require login → mark `[!]` and ask the user to paste the text
 - **PDF**: If the URL points to a PDF, read it directly with the Read tool
 - **`local:` prefix**: Read the local file. Example: `local:jds/linkedin-pm-ai.md` → read `jds/linkedin-pm-ai.md`
+  - **Interactive mode only.** The nightly orchestrator (`run-nightly.ps1`) identifies a job by its normalized http(s) URL (`lib/url-identity.mjs`), so it cannot mark a `local:` row done or failed. `lib/pipeline-state.mjs` therefore reports such rows as `unusable` and the nightly skips them with a `pipeline-parse` row in `data/needs-attention.md`, rather than aborting the batch. Process `local:` entries by hand with `/career-ops pipeline` and remove the row when done.
 
 ## Automatic numbering
 

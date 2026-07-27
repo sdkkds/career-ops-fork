@@ -383,6 +383,51 @@ try {
     # Restore the success stub so nothing downstream (if scenarios are ever
     # reordered/added after this one) inherits a failing digest by accident.
     $env:CAREEROPS_DIGEST_PREFIX_ARGS = "[$($DigestStub | ConvertTo-Json)]"
+
+    Write-Host "14. An unusable pipeline row is skipped, not fatal — the rest of the queue still drains" -ForegroundColor Cyan
+    # modes/pipeline.md documents `local:jds/foo.md` as a legitimate hand-added
+    # entry. The row parses, so it used to be listed and dispatched — and then
+    # Set-PipelineState threw ("cannot set state for unparseable url"), which
+    # aborted the WHOLE batch with exit 1. The row was never marked, so it was
+    # selected first again the next night: one hand-pasted line wedged the
+    # nightly forever and leaked an inflight entry every run. It is deliberately
+    # added FIRST here so it also proves there is no head-of-line blocking.
+    $badRowUrl = 'local:jds/hand-pasted.md'
+    $okUrl3    = 'https://x.test/j/unusable-neighbour'
+    Add-Content $PipelineFile "- [ ] $badRowUrl | HandPasted | PM" -Encoding utf8
+    Add-Content $PipelineFile "- [ ] $okUrl3 | StubCo | Senior Security PM" -Encoding utf8
+    $env:CAREEROPS_WORKER_CMD = $GoodWorker
+    # Same cursor reset as scenario 13, for the same minute-granularity reason.
+    Remove-Item (Join-Path $VaultStub 'digest-cursor.json') -Force -ErrorAction SilentlyContinue
+    pwsh -NoProfile -File "$Root\run-nightly.ps1" -EvalOnly -MaxJobs 5 > "$Scratch\unusable.log" 2>&1
+    $unusableExit = $LASTEXITCODE
+    $unusableLog  = Get-Content "$Scratch\unusable.log" -Raw
+    $badRow  = (Get-Content $PipelineFile -Encoding utf8 | Where-Object { $_ -match [regex]::Escape($badRowUrl) })
+    $okRow3  = (Get-Content $PipelineFile -Encoding utf8 | Where-Object { $_ -match [regex]::Escape($okUrl3) })
+    Write-Host "    exit=$unusableExit  bad row: $badRow" -ForegroundColor DarkGray
+    Write-Host "    good row     : $okRow3" -ForegroundColor DarkGray
+    Assert-True ($unusableExit -eq 0) "one unusable row does not fail the run (got $unusableExit)"
+    Assert-True ($okRow3 -match '^\- \[x\]') "the usable neighbour still drained to done"
+    Assert-True ($badRow -match '^\- \[ \]') "the unusable row is left untouched — it cannot be marked at all"
+    Assert-True ($unusableLog -match 'Unusable pipeline row') "the skip was logged"
+    Assert-True ((Get-Content $NeedsAttn -Raw) -match 'pipeline-parse') "a pipeline-parse needs-attention row was written"
+    Assert-True ((Get-Content $NeedsAttn -Raw) -match [regex]::Escape($badRowUrl)) "the needs-attention row names the unusable entry"
+    # The old failure leaked an inflight entry per run (Set-Inflight ran, then
+    # Set-PipelineState threw before Clear-Inflight could).
+    $inflightAfter = if (Test-Path $InflightFile) { Get-Content $InflightFile -Raw } else { '' }
+    Assert-True ($inflightAfter -notmatch [regex]::Escape($badRowUrl)) "no inflight entry was leaked for the unusable row"
+
+    Write-Host "15. needs-attention timestamps are a single format" -ForegroundColor Cyan
+    # run-nightly.ps1, digest.mjs and merge-tracker.mjs all append to this table.
+    # Two of the three used toISOString(); the orchestrator used
+    # 'yyyy-MM-dd HH:mm', so the same table interleaved two formats.
+    # Only rows THIS run wrote: data/needs-attention.md is live append-only data
+    # and may already hold rows in the old format from before this fix.
+    $naRows = @(Get-Content $NeedsAttn -Encoding utf8 |
+        Where-Object { $_ -match '^\| ' -and ($_ -match 'x\.test' -or $_ -match [regex]::Escape($badRowUrl)) })
+    Assert-True ($naRows.Count -gt 0) "there are needs-attention rows to check (got $($naRows.Count))"
+    $badStamps = @($naRows | Where-Object { $_ -notmatch '^\| \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}' })
+    Assert-True ($badStamps.Count -eq 0) "every needs-attention timestamp is ISO-8601 (got $($badStamps.Count) that are not: $($badStamps -join ' // '))"
 }
 finally {
     Remove-Item Env:\CAREEROPS_WORKER_CMD          -ErrorAction SilentlyContinue

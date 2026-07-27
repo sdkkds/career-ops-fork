@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parsePipeline, setState, listActionable, RETRY_BUDGET } from '../lib/pipeline-state.mjs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  parsePipeline, setState, listActionable, selectActionable, selectByState, RETRY_BUDGET,
+} from '../lib/pipeline-state.mjs';
 
 const TEXT = [
   '# Pipeline — Pending Evaluations',
@@ -304,4 +310,131 @@ test('listActionable returns real-shape entries that parse correctly', () => {
   assert(urls.includes('https://boards.greenhouse.io/acme/jobs/792'));
   assert(urls.includes('https://lever.co/companies/foo/jobs/bar'));
   assert(urls.includes('https://x.test/j/999')); // failed, attempts:1 < budget:2
+});
+
+// ---------------------------------------------------------------------------
+// Whole-branch review, finding 2: URL aliasing
+//
+// scan.mjs dedups with its own looser normalizeUrlForDedup (keeps scheme, keeps
+// `www.`, keeps host case, does not sort params), so two rows that are distinct
+// to the scanner can be ONE identity to lib/url-identity.mjs. setState used to
+// `.find` the first match: marking row 2 done flipped row 1's marker and left
+// row 2 pending, so row 2 was re-dispatched every night, marked row 1 again, and
+// never drained — a paid worker per run, reported as `completed`.
+// ---------------------------------------------------------------------------
+
+const TEXT_ALIASED = [
+  '# Pipeline',
+  '',
+  '- [ ] http://www.boards.greenhouse.io/acme/jobs/1 | Acme | PM',
+  '- [ ] https://boards.greenhouse.io/acme/jobs/1 | Acme | PM',
+  '',
+].join('\n');
+
+test('setState throws when two rows share one normalized identity', () => {
+  assert.throws(
+    () => setState(TEXT_ALIASED, 'https://boards.greenhouse.io/acme/jobs/1', 'done'),
+    /ambiguous url in pipeline: 2 rows/,
+    'aliasing must fail loud into the orchestrator "queue and run have diverged" path, not silently mark the wrong row');
+});
+
+test('the ambiguity error names both offending lines so a human can fix the file', () => {
+  try {
+    setState(TEXT_ALIASED, 'https://boards.greenhouse.io/acme/jobs/1', 'done');
+    assert.fail('expected a throw');
+  } catch (err) {
+    assert.match(err.message, /line 3/);
+    assert.match(err.message, /line 4/);
+  }
+});
+
+test('a single row still round-trips — the ambiguity guard is not over-eager', () => {
+  const out = setState(TEXT, 'https://x.test/j/1', 'done');
+  assert.match(out, /- \[x\] https:\/\/x\.test\/j\/1/);
+});
+
+// ---------------------------------------------------------------------------
+// Whole-branch review, finding 3: unusable rows
+//
+// modes/pipeline.md documents `local:jds/foo.md` as a first-class entry. It
+// parses, so listActionable used to return it, the orchestrator dispatched it,
+// and setState threw -> the whole batch aborted with "the queue and this run
+// have diverged". The row was never marked, so it was selected first again the
+// next night: one hand-pasted row wedged the nightly forever (leaking an
+// inflight entry each time). They must be split out, not dispatched, not fatal.
+// ---------------------------------------------------------------------------
+
+const TEXT_UNUSABLE = [
+  '# Pipeline',
+  '',
+  '- [ ] local:jds/acme-pm.md | Acme | PM',
+  '- [ ] https://x.test/j/live | Beta | TPM',
+  '- [ ] not-a-url-at-all | Gamma | PO',
+  '- [!] mailto:someone@x.test | Delta | PM <!-- attempts:1 -->',
+  '',
+].join('\n');
+
+test('listActionable skips rows whose url cannot be normalized', () => {
+  const urls = listActionable(TEXT_UNUSABLE, { limit: 10 }).map(e => e.url);
+  assert.deepEqual(urls, ['https://x.test/j/live']);
+});
+
+test('selectActionable surfaces the unusable rows separately rather than dropping them', () => {
+  const sel = selectActionable(TEXT_UNUSABLE, { limit: 10 });
+  assert.equal(sel.rows.length, 1);
+  assert.deepEqual(sel.unusable.map(e => e.url).sort(),
+    ['local:jds/acme-pm.md', 'mailto:someone@x.test', 'not-a-url-at-all']);
+});
+
+test('the limit applies to usable rows only — bad rows do not eat the batch budget', () => {
+  const sel = selectActionable(TEXT_UNUSABLE, { limit: 1 });
+  assert.deepEqual(sel.rows.map(e => e.url), ['https://x.test/j/live']);
+});
+
+test('selectByState splits unusable rows out of a state query too', () => {
+  const staged = setState(TEXT_UNUSABLE, 'https://x.test/j/live', 'in-progress');
+  const sel = selectByState(staged, 'in-progress');
+  assert.deepEqual(sel.rows.map(e => e.url), ['https://x.test/j/live']);
+  assert.equal(sel.unusable.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// CLI contract — run-nightly.ps1 reads .rows and .unusable off this JSON.
+// ---------------------------------------------------------------------------
+
+test('CLI --list emits {rows, unusable} and never dispatches an unusable row', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'careerops-ps-'));
+  const file = join(dir, 'pipeline.md');
+  try {
+    writeFileSync(file, TEXT_UNUSABLE, 'utf-8');
+    const out = execFileSync(process.execPath,
+      ['lib/pipeline-state.mjs', '--file', file, '--list', '--limit', '10'],
+      { cwd: join(import.meta.dirname, '..'), encoding: 'utf-8' });
+    const parsed = JSON.parse(out);
+    assert.deepEqual(Object.keys(parsed).sort(), ['rows', 'unusable']);
+    assert.deepEqual(parsed.rows.map(r => r.url), ['https://x.test/j/live']);
+    assert.equal(parsed.unusable.length, 3);
+    // Contract projection: internals must not leak into the PowerShell side.
+    assert.deepEqual(Object.keys(parsed.rows[0]).sort(),
+      ['attempts', 'company', 'state', 'title', 'url']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('CLI --list --state also emits {rows, unusable}', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'careerops-ps-'));
+  const file = join(dir, 'pipeline.md');
+  try {
+    writeFileSync(file, TEXT_UNUSABLE, 'utf-8');
+    const out = execFileSync(process.execPath,
+      ['lib/pipeline-state.mjs', '--file', file, '--list', '--state', 'pending'],
+      { cwd: join(import.meta.dirname, '..'), encoding: 'utf-8' });
+    const parsed = JSON.parse(out);
+    assert.deepEqual(Object.keys(parsed).sort(), ['rows', 'unusable']);
+    assert.deepEqual(parsed.rows.map(r => r.url), ['https://x.test/j/live']);
+    assert.equal(parsed.unusable.length, 2); // the mailto row is failed, not pending
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

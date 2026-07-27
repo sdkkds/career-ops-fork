@@ -77,6 +77,13 @@ $VaultDir      = if ($env:CAREEROPS_VAULT_DIR) { $env:CAREEROPS_VAULT_DIR }
                  else { "D:\sunja\projects\personal\Fortress of Solitude\career-ops" }
 $Date          = (Get-Date).ToString("yyyy-MM-dd")
 $RunTimestamp  = (Get-Date).ToString("yyyy-MM-dd HH:mm")
+# needs-attention.md is written by three producers (this script, digest.mjs and
+# merge-tracker.mjs). The other two use JS `toISOString()`, so this one matches
+# them rather than interleaving a second format into the same table. Kept
+# separate from $RunTimestamp on purpose: that value is also the decisions.jsonl
+# `evaluated_at` the digest cursor compares against, and reformatting it would
+# change the digest window semantics.
+$RunTimestampIso = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 $LogDir        = "$ProjectDir\batch\logs"
 $ReportsDir    = "$ProjectDir\reports"
 $TsvDir        = "$ProjectDir\batch\tracker-additions"
@@ -226,7 +233,7 @@ function Add-NeedsAttention {
     param([string]$Url, [string]$Stage, [string]$Reason)
     # Passed via env var rather than inline in the -e string: reasons contain
     # quotes, semicolons and URLs, and PowerShell->node quoting mangles them.
-    $env:CAREEROPS_NA_JSON = (@{ url = $Url; stage = $Stage; reason = $Reason; at = $RunTimestamp } | ConvertTo-Json -Compress)
+    $env:CAREEROPS_NA_JSON = (@{ url = $Url; stage = $Stage; reason = $Reason; at = $RunTimestampIso } | ConvertTo-Json -Compress)
     try {
         & node -e "import('./lib/needs-attention.mjs').then(m => m.appendNeedsAttention(process.argv[1], JSON.parse(process.env.CAREEROPS_NA_JSON)))" $NeedsAttnFile | Out-Null
         if ($LASTEXITCODE -ne 0) {
@@ -237,16 +244,61 @@ function Add-NeedsAttention {
     }
 }
 
+# Pipeline rows are read ONLY through lib/pipeline-state.mjs. This script must
+# never regex data/pipeline.md itself: the module deliberately tolerates '-  [ ]'
+# and '-\t[x]' and CRLF, and a private pattern here silently disagrees with it.
+# Returns a PSCustomObject with .rows and .unusable, or $null on failure.
+function Get-PipelineSelection {
+    param([string]$State, [int]$Limit = -1)
+    if (-not (Test-Path $PipelineFile)) { return $null }
+    if ($State) {
+        $json = & node lib/pipeline-state.mjs --file $PipelineFile --list --state $State
+    } elseif ($Limit -ge 0) {
+        $json = & node lib/pipeline-state.mjs --file $PipelineFile --list --limit $Limit
+    } else {
+        $json = & node lib/pipeline-state.mjs --file $PipelineFile --list
+    }
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return (($json | Out-String) | ConvertFrom-Json)
+}
+
+# Every pending row's URL, unusable ones included — the scan delta counts rows
+# added, and a scan that added a malformed row still added a row.
+function Get-PipelineUrls {
+    param([string]$State)
+    $sel = Get-PipelineSelection -State $State
+    if ($null -eq $sel) {
+        Write-Log "WARN: could not list '$State' rows from $PipelineFile; the scan delta count may be wrong." 'Yellow'
+        return @()
+    }
+    return @(@($sel.rows) + @($sel.unusable) | ForEach-Object { $_.url })
+}
+
+# One needs-attention row per pipeline entry that can never be dispatched (a
+# `local:jds/foo.md` row, a typo'd URL). Marking is impossible for these, so
+# treating them as fatal would abort the whole batch and leave them unmarked —
+# selected first again the next night, forever. Skip them, record them, continue.
+function Report-UnusablePipelineRows {
+    param($Selection, [string]$Phase)
+    if ($null -eq $Selection) { return }
+    foreach ($bad in @($Selection.unusable)) {
+        Write-Log "Unusable pipeline row (not a http(s) URL) — skipped: $($bad.url)" 'Yellow'
+        if (-not $DryRun) {
+            Add-NeedsAttention -Url $bad.url -Stage 'pipeline-parse' `
+                -Reason "pipeline row is not a usable http(s) URL, so it can never be dispatched or marked ($Phase); fix or remove the row by hand"
+        }
+    }
+}
+
 # ---- SCAN ----
 
 if (-not $EvalOnly) {
     Write-Log "=== SCAN phase ===" 'Cyan'
     $scanLog = "$LogDir\scan-$Date.log"
 
-    $before = @()
-    if (Test-Path $PipelineFile) {
-        $before = @((Get-Content $PipelineFile -Encoding utf8) | Where-Object { $_ -match '^\- \[ \]' })
-    }
+    # Counted through the module, not a local regex: '^\- \[ \]' misses the
+    # '-  [ ]' and '-\t[ ]' rows the module accepts, so the delta under-reported.
+    $before = @(Get-PipelineUrls -State 'pending')
 
     if ($DryRun) {
         Write-Log "[DRY RUN] Would run: claude --print (scan)" 'Yellow'
@@ -307,10 +359,7 @@ if (-not $EvalOnly) {
         Write-Log "Scan complete. Log: $scanLog" 'Green'
     }
 
-    $after = @()
-    if (Test-Path $PipelineFile) {
-        $after = @((Get-Content $PipelineFile -Encoding utf8) | Where-Object { $_ -match '^\- \[ \]' })
-    }
+    $after = @(Get-PipelineUrls -State 'pending')
     Write-Log "$(@($after | Where-Object { $before -notcontains $_ }).Count) new job(s) added by scan."
 }
 
@@ -335,13 +384,14 @@ if ($ScanOnly) {
 # the operator may delete the lock, and the stale-lock branch removes it on PID
 # reuse). So reap only rows whose owning PID is gone. Reaping a row owned by a
 # live run would double-dispatch a paid worker and corrupt the queue.
-$staleJson = & node lib/pipeline-state.mjs --file $PipelineFile --list --state in-progress
-if ($LASTEXITCODE -ne 0) {
-    Write-Log "FATAL: could not list in-progress jobs from $PipelineFile (exit $LASTEXITCODE)." 'Red'
+$staleSel = Get-PipelineSelection -State 'in-progress'
+if ($null -eq $staleSel) {
+    Write-Log "FATAL: could not list in-progress jobs from $PipelineFile." 'Red'
     exit 1
 }
+Report-UnusablePipelineRows -Selection $staleSel -Phase 'crash-recovery'
 $inflight = Get-Inflight
-foreach ($stale in @(($staleJson | Out-String) | ConvertFrom-Json)) {
+foreach ($stale in @($staleSel.rows)) {
     if (Test-InflightOwnedByOther -Map $inflight -Url $stale.url) {
         Write-Log "Leaving in-progress row alone — another live run owns it: $($stale.url)" 'Yellow'
         continue
@@ -356,12 +406,13 @@ foreach ($stale in @(($staleJson | Out-String) | ConvertFrom-Json)) {
     Add-NeedsAttention -Url $stale.url -Stage 'crash-recovery' -Reason 'left in-progress by a run that did not finish'
 }
 
-$listJson = & node lib/pipeline-state.mjs --file $PipelineFile --list --limit $MaxJobs
-if ($LASTEXITCODE -ne 0) {
-    Write-Log "FATAL: could not list actionable jobs from $PipelineFile (exit $LASTEXITCODE)." 'Red'
+$listSel = Get-PipelineSelection -Limit $MaxJobs
+if ($null -eq $listSel) {
+    Write-Log "FATAL: could not list actionable jobs from $PipelineFile." 'Red'
     exit 1
 }
-$jobs = @(($listJson | Out-String) | ConvertFrom-Json)
+Report-UnusablePipelineRows -Selection $listSel -Phase 'dispatch'
+$jobs = @($listSel.rows)
 Write-Log "$($jobs.Count) actionable job(s) (pending + retryable failures)."
 
 # ---- EVALUATE ----
