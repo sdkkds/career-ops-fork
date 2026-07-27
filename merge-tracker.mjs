@@ -15,15 +15,25 @@
  */
 
 import { readFileSync, readdirSync, mkdirSync, renameSync, existsSync } from 'fs';
-import { join, basename, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join, basename, dirname, resolve } from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { execFileSync } from 'child_process';
 import { normalizeReportLink as normalizeLink } from './tracker-links.mjs';
 import { roleFuzzyMatch } from './role-matcher.mjs';
 import { LEGACY_COLMAP, detectColumns, resolveScoreStatus, normalizeVia } from './tracker-parse.mjs';
 import { resolveTrackerPath, trackerLockDirFor, acquireTrackerLock, writeFileAtomic, normalizeCompany, cell } from './tracker-utils.mjs';
+import { normalizeUrl } from './lib/url-identity.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
+// True only when this file is executed directly (`node merge-tracker.mjs` or
+// a test spawning it as a subprocess) — not when another module (e.g. a unit
+// test) imports it for its exported helpers. The CLI body below acquires a
+// real filesystem lock on the tracker and reads/writes/exits the process, all
+// of which would be an unwanted, potentially data-mutating side effect of a
+// plain `import { findDuplicateByUrl } from './merge-tracker.mjs'`.
+const IS_CLI = process.argv[1]
+  ? pathToFileURL(resolve(process.argv[1])).href === import.meta.url
+  : false;
 // Support both layouts: data/applications.md (boilerplate) and applications.md
 // (original). CAREER_OPS_TRACKER overrides the path (used by tests and
 // non-standard layouts). Resolution lives in tracker-utils.mjs so every tracker
@@ -81,6 +91,7 @@ function sleep(ms) {
 }
 
 let trackerLock;
+if (IS_CLI) {
 try {
   trackerLock = await acquireTrackerLock(TRACKER_LOCK_DIR, {
     timeoutMs: Number(process.env.CAREER_OPS_TRACKER_LOCK_TIMEOUT_MS) || 60_000,
@@ -95,6 +106,7 @@ try {
 } catch (err) {
   console.error(`❌ ${err.message}`);
   process.exit(1);
+}
 }
 
 // Canonical states and aliases
@@ -192,6 +204,26 @@ function extractReqNumber(notes) {
 }
 
 /**
+ * Tier 0 dedup — normalized job URL. Runs BEFORE the report-number,
+ * exact-number, and company+role fuzzy tiers: a URL match is exact identity,
+ * so it must win over any heuristic. Rows without a parseable URL are
+ * skipped entirely — a missing/invalid URL is never a wildcard match.
+ *
+ * @param {object[]} rows - Existing tracker rows (each may carry a `url` cell).
+ * @param {string} candidateUrl - Raw URL cell from the incoming addition.
+ * @returns {object|null} The matching existing row, or null.
+ */
+export function findDuplicateByUrl(rows, candidateUrl) {
+  const key = normalizeUrl(candidateUrl);
+  if (!key) return null;
+  for (const row of rows) {
+    const rowKey = normalizeUrl(row.url);
+    if (rowKey && rowKey === key) return row;
+  }
+  return null;
+}
+
+/**
  * Parse a score cell into a numeric value for score-upgrade decisions.
  *
  * The merge path compares old and new scores to decide whether to update an
@@ -227,7 +259,9 @@ function buildRow(o) {
   if (COLMAP.via != null) cells.push(cell(o.via) || '—');
   cells.push(cell(o.role));
   if (COLMAP.location != null) cells.push(cell(o.location) || '—');
-  cells.push(o.score, o.status, o.pdf, o.report, cell(o.notes));
+  cells.push(o.score, o.status, o.pdf, o.report);
+  if (COLMAP.url != null) cells.push(cell(o.url) || '—');
+  cells.push(cell(o.notes));
   return `| ${cells.join(' | ')} |`;
 }
 
@@ -258,6 +292,7 @@ function parseAppLine(line) {
     status: parts[COLMAP.status],
     pdf: parts[COLMAP.pdf],
     report: parts[COLMAP.report],
+    url: COLMAP.url != null ? (parts[COLMAP.url] || '') : '',
     notes: COLMAP.notes != null ? (parts[COLMAP.notes] || '') : '',
     raw: line,
   };
@@ -282,25 +317,38 @@ function parseAppLine(line) {
  * slot: TSV writers are LLM agents following prompt instructions, and a writer
  * that skips an empty padding field would silently shift a positional Via into
  * the Location slot (#1596). A single untagged extra remains the legacy
- * positional location (stale prompts stay valid forever). Anything ambiguous —
- * two untagged extras, duplicate via= tags — returns null so the row is
- * rejected loudly instead of merged with scrambled columns.
+ * positional location (stale prompts stay valid forever).
+ *
+ * The job URL (Task 3) is identified by SHAPE, not position, for the same
+ * reason: it's appended last by the batch prompt, which is the exact slot
+ * this legacy extras zone already occupies for location/via. Classifying by
+ * content — does it parse as an http(s) URL? — lets a URL, a via= tag, and a
+ * location all coexist in the same trailing zone without moving any existing
+ * writer's field, and keeps every pre-existing 9-column TSV (no URL) parsing
+ * exactly as before.
+ *
+ * Anything ambiguous — two untagged non-URL extras, two URL-shaped extras,
+ * duplicate via= tags — returns null so the row is rejected loudly instead of
+ * merged with scrambled columns.
  *
  * @param {string[]} parts - All fields of the TSV/pipe row.
  * @param {string} filename - Source filename used in warning messages.
- * @returns {{via: string, location: string}|null}
+ * @returns {{via: string, location: string, url: string}|null}
  */
 function parseTsvExtras(parts, filename) {
   const extras = parts.slice(9).map(s => String(s).trim()).filter(s => s !== '');
   const viaTags = extras.filter(s => /^via=/i.test(s));
-  const untagged = extras.filter(s => !/^via=/i.test(s));
-  if (viaTags.length > 1 || untagged.length > 1) {
-    console.warn(`⚠️  Skipping ${filename}: ambiguous extra fields [${extras.join(', ')}] — expected at most one "via=Firm" tag and one location`);
+  const rest = extras.filter(s => !/^via=/i.test(s));
+  const urlLike = rest.filter(s => normalizeUrl(s) != null);
+  const untagged = rest.filter(s => normalizeUrl(s) == null);
+  if (viaTags.length > 1 || untagged.length > 1 || urlLike.length > 1) {
+    console.warn(`⚠️  Skipping ${filename}: ambiguous extra fields [${extras.join(', ')}] — expected at most one "via=Firm" tag, one location, and one URL`);
     return null;
   }
   return {
     via: viaTags.length ? viaTags[0].replace(/^via=/i, '').trim() : '',
     location: untagged[0] || '',
+    url: urlLike[0] || '',
   };
 }
 
@@ -389,6 +437,10 @@ function parseTsvContent(content, filename) {
 }
 
 // ---- Main ----
+// Guarded by IS_CLI (see top of file): this entire section reads, locks, and
+// writes the real tracker file and calls process.exit() on several paths, so
+// it must never run as a side effect of importing this module's exports.
+if (IS_CLI) {
 
 // Read applications.md
 if (!existsSync(APPS_FILE)) {
@@ -552,12 +604,14 @@ for (const file of tsvFiles) {
   addition.report = normalizeReportLink(addition.report);
 
   // Check for duplicate by:
+  // 0. Normalized job URL — exact identity, checked first so it wins over
+  //    every heuristic tier below (Task 3, see findDuplicateByUrl above).
   // 1. Exact report number match
   // 2. Company + role fuzzy match
   const reportNum = extractReportNum(addition.report);
-  let duplicate = null;
+  let duplicate = findDuplicateByUrl(existingApps, addition.url);
 
-  if (reportNum) {
+  if (!duplicate && reportNum) {
     // Report-number match must also confirm company (#912). Report-file
     // sequence and tracker-row sequence are independent, so the same number
     // appearing for two different companies is sequence drift, not a duplicate.
@@ -626,6 +680,7 @@ for (const file of tsvFiles) {
           location: addition.location || duplicate.location || '—',
           score: addition.score, status: duplicate.status, pdf: duplicate.pdf,
           report: addition.report,
+          url: addition.url || duplicate.url || '—',
           notes: `Re-eval ${addition.date} (${oldScore}→${newScore}). ${addition.notes}`,
         });
         appLines[lineIdx] = updatedLine;
@@ -661,6 +716,7 @@ for (const file of tsvFiles) {
       location: addition.location || '—',
       score: addition.score, status: addition.status, pdf: addition.pdf,
       report: addition.report, notes: addition.notes,
+      url: addition.url || '—',
     });
     newLines.push(newLine);
     added++;
@@ -708,3 +764,5 @@ if (VERIFY && !DRY_RUN) {
     process.exit(1);
   }
 }
+
+} // end IS_CLI

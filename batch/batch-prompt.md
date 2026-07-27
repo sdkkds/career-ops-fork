@@ -445,10 +445,10 @@ Write exactly one TSV line to:
 batch/tracker-additions/{{ID}}.tsv
 ```
 
-Format, no header, 9 tab-separated columns:
+Format, no header, 10 tab-separated columns:
 
 ```text
-{{REPORT_NUM}}\t{{DATE}}\t{company}\t{role}\t{status}\t{score}/5\t{pdf_emoji}\t[{{REPORT_NUM}}](reports/{{REPORT_NUM}}-{company-slug}-{{DATE}}.md)\t{one_sentence_note}
+{{REPORT_NUM}}\t{{DATE}}\t{company}\t{role}\t{status}\t{score}/5\t{pdf_emoji}\t[{{REPORT_NUM}}](reports/{{REPORT_NUM}}-{company-slug}-{{DATE}}.md)\t{one_sentence_note}\t{{URL}}
 ```
 
 Column order is important:
@@ -464,10 +464,15 @@ Column order is important:
 | 7 | pdf | emoji | `✅` or `❌` |
 | 8 | report | markdown link | `[647](reports/647-...)` |
 | 9 | notes | string | one concise sentence |
+| 10 | url | URL | `{{URL}}` |
+
+**Mandatory:** column 10 (`url`) is the job's identity — `merge-tracker.mjs` deduplicates on it before any other check. Without it a row can't be matched by URL and falls back to the weaker company/role heuristics, so always include it.
 
 **Important:** TSV order has status BEFORE score. `applications.md` displays score before status. `merge-tracker.mjs` handles the conversion.
 
-**Optional fields (column ≥ 10):** if the offer came through an agency/recruiter (#1596), append a labeled field `via={Agency}` (for example `via=Hays`) — never positional; the label is mandatory. One extra unlabeled field is interpreted as the legacy location column. If the end employer is unknown, use `?` as company and add the descriptor in notes (for example `fintech, Leeds`). `merge-tracker.mjs` rejects ambiguous extras (two unlabeled extras, or two `via=` fields).
+**Forbidden inside any field:** `|`, tab, or newline characters. Replace them with `/` and a space before writing the line.
+
+**Optional fields (column ≥ 10):** if the offer came through an agency/recruiter (#1596), append a labeled field `via={Agency}` (for example `via=Hays`) — never positional; the label is mandatory. `merge-tracker.mjs` identifies the trailing fields by shape, not fixed position: whichever one parses as an `http(s)://` URL is the URL (column 10 above), one further unlabeled non-URL field is the legacy location column, and any `via=` field is the agency — so `{{URL}}`, an optional location, and an optional `via=` tag can appear in any order after `notes`. If the end employer is unknown, use `?` as company and add the descriptor in notes (for example `fintech, Leeds`). `merge-tracker.mjs` rejects ambiguous extras (two unlabeled non-URL extras, two URL-shaped extras, or two `via=` fields).
 
 Valid canonical statuses are defined in `templates/states.yml`: `Evaluated`, `Applied`, `Responded`, `Interview`, `Offer`, `Rejected`, `Discarded`, `SKIP`.
 
