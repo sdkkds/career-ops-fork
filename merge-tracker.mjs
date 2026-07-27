@@ -14,7 +14,7 @@
  * Run: node career-ops/merge-tracker.mjs [--dry-run] [--verify]
  */
 
-import { readFileSync, readdirSync, mkdirSync, renameSync, existsSync } from 'fs';
+import { readFileSync, readdirSync, mkdirSync, renameSync, existsSync, realpathSync } from 'fs';
 import { join, basename, dirname, resolve } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { execFileSync } from 'child_process';
@@ -31,8 +31,17 @@ const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 // real filesystem lock on the tracker and reads/writes/exits the process, all
 // of which would be an unwanted, potentially data-mutating side effect of a
 // plain `import { findDuplicateByUrl } from './merge-tracker.mjs'`.
+// Node computes import.meta.url from the REALPATH of the main module (symlinks
+// resolved), but a plain resolve() does not resolve symlinks — a symlinked
+// invocation (or a bin shim) would then never match, silently skipping the
+// entire CLI body (process exits 0, does nothing, logs nothing). Try the
+// realpath first; fall back to resolve() only if the path can't be stat'd
+// (e.g. it genuinely doesn't exist), so a lookup failure never masks a real
+// mismatch — it degrades to the same comparison as before.
 const IS_CLI = process.argv[1]
-  ? pathToFileURL(resolve(process.argv[1])).href === import.meta.url
+  ? pathToFileURL((() => {
+      try { return realpathSync(process.argv[1]); } catch { return resolve(process.argv[1]); }
+    })()).href === import.meta.url
   : false;
 // Support both layouts: data/applications.md (boilerplate) and applications.md
 // (original). CAREER_OPS_TRACKER overrides the path (used by tests and
@@ -224,6 +233,32 @@ export function findDuplicateByUrl(rows, candidateUrl) {
 }
 
 /**
+ * Whether two URLs prove their rows are NOT the same posting.
+ *
+ * The flip side of findDuplicateByUrl: a URL MATCH is exact identity that
+ * wins over every heuristic tier, but a confirmed URL MISMATCH is just as
+ * strong a signal in the other direction — it is exactly the "two genuinely
+ * distinct roles at one company" collision the URL column exists to prevent
+ * (module header comment). Every heuristic tier below (report-number,
+ * exact-number, company+role fuzzy) guards its own match with this check, the
+ * same way the existing req/job-number guard already does for the fuzzy tier.
+ *
+ * Mirrors that guard's rule exactly: only treat this as evidence the rows
+ * differ when BOTH sides carry a parseable URL and they disagree — a missing
+ * or unparseable URL on either side falls back to today's heuristic-only
+ * behavior unchanged. This never invents a mismatch from absence.
+ *
+ * @param {string} additionUrl - Raw URL cell from the incoming addition.
+ * @param {string} appUrl - Raw URL cell from an existing tracker row.
+ * @returns {boolean} True when both sides have a URL and they differ.
+ */
+function urlsConfirmedDifferent(additionUrl, appUrl) {
+  const a = normalizeUrl(additionUrl);
+  const b = normalizeUrl(appUrl);
+  return Boolean(a && b && a !== b);
+}
+
+/**
  * Parse a score cell into a numeric value for score-upgrade decisions.
  *
  * The merge path compares old and new scores to decide whether to update an
@@ -333,10 +368,15 @@ function parseAppLine(line) {
  *
  * @param {string[]} parts - All fields of the TSV/pipe row.
  * @param {string} filename - Source filename used in warning messages.
+ * @param {number} [extrasStartIdx=9] - First index treated as an extra. The
+ *   tab-separated path always passes the default (its core fields are fixed at
+ *   0-8). The pipe-delimited path passes 10 when it has already consumed
+ *   index 8 as a directly-detected URL (see parseTsvContent), so the extras
+ *   zone starts one field later there.
  * @returns {{via: string, location: string, url: string}|null}
  */
-function parseTsvExtras(parts, filename) {
-  const extras = parts.slice(9).map(s => String(s).trim()).filter(s => s !== '');
+function parseTsvExtras(parts, filename, extrasStartIdx = 9) {
+  const extras = parts.slice(extrasStartIdx).map(s => String(s).trim()).filter(s => s !== '');
   const viaTags = extras.filter(s => /^via=/i.test(s));
   const rest = extras.filter(s => !/^via=/i.test(s));
   const urlLike = rest.filter(s => normalizeUrl(s) != null);
@@ -368,7 +408,7 @@ function parseTsvContent(content, filename) {
       console.warn(`⚠️  Skipping malformed pipe-delimited ${filename}: ${parts.length} fields`);
       return null;
     }
-    // Format: num | date | company | role | score | status | pdf | report | notes [| location]
+    // Format: num | date | company | role | score | status | pdf | report | [url] | notes [| location]
     // Identify score vs status by content, not position, so a swapped row can't
     // merge silently (#1427).
     const resolved = resolveScoreStatus(parts[4], parts[5]);
@@ -376,6 +416,16 @@ function parseTsvContent(content, filename) {
       console.warn(`⚠️  Skipping ${filename}: cannot tell score from status in columns 5–6 ("${parts[4]}" | "${parts[5]}") — refusing to merge a possible column swap`);
       return null;
     }
+    // The live tracker's URL column (Task 3) sits right after Report and
+    // before Notes, so a row pasted verbatim from applications.md carries the
+    // URL at index 8 — one earlier than the pre-URL layout's notes-at-8.
+    // Detect it by shape (same rule as the TSV extras zone below) so an old
+    // paste (no URL column) and a new paste both parse correctly, instead of
+    // the URL silently becoming "notes" and the real notes becoming a bogus
+    // "location" with no warning (#Task3 review finding 3).
+    const urlAtEight = parts.length > 8 && normalizeUrl(parts[8]) != null;
+    const notesIdx = urlAtEight ? 9 : 8;
+    const extrasStartIdx = urlAtEight ? 10 : 9;
     addition = {
       num: parseInt(parts[0]),
       date: parts[1],
@@ -387,11 +437,12 @@ function parseTsvContent(content, filename) {
       status: validateStatus(resolved.status),
       pdf: parts[6],
       report: parts[7],
-      notes: parts[8] || '',
+      notes: parts[notesIdx] || '',
     };
-    const extras = parseTsvExtras(parts, filename);
+    const extras = parseTsvExtras(parts, filename, extrasStartIdx);
     if (!extras) return null;
     Object.assign(addition, extras);
+    if (urlAtEight) addition.url = parts[8];
   } else {
     // Tab-separated
     parts = content.split('\t');
@@ -519,6 +570,7 @@ const appLines = appContent.split('\n');
 COLMAP = detectColumns(appLines) || LEGACY_COLMAP;
 if (COLMAP.location != null) console.log('🧭 Detected Location column.');
 if (COLMAP.via != null) console.log('🧭 Detected Via column.');
+if (COLMAP.url != null) console.log('🧭 Detected URL column.');
 const existingApps = [];
 let maxNum = 0;
 
@@ -598,6 +650,17 @@ for (const file of tsvFiles) {
     addition.via = '';
   }
 
+  // A URL can only be stored if the tracker has a URL column. Unlike Via, there
+  // is no --migrate flag for this yet — but silently dropping it is worse than
+  // dropping via=: the URL is this row's tier-0 identity (#Task3), so losing it
+  // pushes every future merge for this job onto the weaker heuristic tiers
+  // forever, with nothing in the log to explain why. Warn loudly instead of
+  // dropping without a trace.
+  if (addition.url && COLMAP.url == null) {
+    console.warn(`⚠️  ${file}: carries URL ${addition.url} but the tracker has no URL column — value dropped. Add "| URL |" to the applications.md header to enable URL-based dedup.`);
+    addition.url = '';
+  }
+
   // Normalize the report link to be relative to the tracker file's directory.
   // The TSV convention carries a root-relative `reports/...` link; rewrite it
   // so it resolves correctly when clicked from applications.md (see #760).
@@ -620,7 +683,14 @@ for (const file of tsvFiles) {
     const normCompany = normalizeCompany(addition.company);
     duplicate = existingApps.find(app => {
       const existingReportNum = extractReportNum(app.report);
-      return existingReportNum === reportNum && normalizeCompany(app.company) === normCompany;
+      if (existingReportNum !== reportNum || normalizeCompany(app.company) !== normCompany) return false;
+      // URL guard (Task 3 review): report-file numbering and tracker-row
+      // numbering can drift independently of the job itself, so a matching
+      // report number + company is not proof when both sides also carry a
+      // URL and those URLs disagree — that's stronger, confirmed evidence
+      // these are two different postings.
+      if (urlsConfirmedDifferent(addition.url, app.url)) return false;
+      return true;
     });
   }
 
@@ -632,9 +702,13 @@ for (const file of tsvFiles) {
     // *different* companies is that drift, not a duplicate — matching on num
     // alone silently merges a brand-new role into an unrelated existing row.
     const normCompany = normalizeCompany(addition.company);
-    duplicate = existingApps.find(app =>
-      app.num === addition.num && normalizeCompany(app.company) === normCompany
-    );
+    duplicate = existingApps.find(app => {
+      if (app.num !== addition.num || normalizeCompany(app.company) !== normCompany) return false;
+      // URL guard (Task 3 review): same rationale as the report-number tier
+      // above — a confirmed URL mismatch overrides a bare number+company hit.
+      if (urlsConfirmedDifferent(addition.url, app.url)) return false;
+      return true;
+    });
   }
 
   if (!duplicate) {
@@ -662,6 +736,9 @@ for (const file of tsvFiles) {
       // back to today's fuzzy-match-only behavior unchanged.
       const appReqNum = extractReqNumber(app.notes);
       if (additionReqNum && appReqNum && additionReqNum !== appReqNum) return false;
+      // URL guard (Task 3 review): same rationale as the two tiers above —
+      // a confirmed URL mismatch overrides a company+role fuzzy hit too.
+      if (urlsConfirmedDifferent(addition.url, app.url)) return false;
       return true;
     });
   }
