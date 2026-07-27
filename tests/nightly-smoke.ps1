@@ -131,6 +131,15 @@ process.exit(0);
 $env:CAREEROPS_DIGEST_CMD         = 'node'
 $env:CAREEROPS_DIGEST_PREFIX_ARGS = "[$($DigestStub | ConvertTo-Json)]"
 
+# Digest FAILURE stub — exits 1, simulating a send failure (gws down, not
+# authenticated, network error) without ever touching a real mail transport.
+# Used by scenario 13 below.
+$DigestFailStub = Join-Path $Scratch 'digest-fail-stub.mjs'
+@'
+console.error("digest stub: simulated send failure");
+process.exit(1);
+'@ | Set-Content $DigestFailStub -Encoding utf8
+
 $Tracker        = "$Root\data\applications.md"
 $InflightFile   = "$Root\batch\.nightly-inflight.json"
 $pipelineBackup = Get-Content $PipelineFile -Raw -Encoding utf8
@@ -335,6 +344,36 @@ try {
     Assert-True ($ownedExit -eq 0) "nothing else was actionable, so the run exited 0 (got $ownedExit)"
     Assert-True ((Get-Content $NeedsAttn -Raw) -notmatch [regex]::Escape($ownedUrl)) `
                 "no crash-recovery row was written for the live-owned job"
+
+    Write-Host "13. Digest send fails during a partial batch: exit 1, but the partial-batch state is still logged" -ForegroundColor Cyan
+    # Regression guard for two review findings caught only by static trace:
+    #   - a digest failure must exit 1, not be silently swallowed or folded
+    #     into the exit-2 "normal dead postings" case
+    #   - a digest failure must NOT suppress the PARTIAL log line — both
+    #     problems (dead postings AND an unnotified operator) must be on
+    #     record for this run, even though only one exit code is returned.
+    $goodUrl2 = 'https://x.test/j/digestfail-good'
+    $deadUrl2 = 'https://x.test/j/digestfail-dead'
+    Add-Content $PipelineFile "- [ ] $goodUrl2 | StubCo | Senior Security PM" -Encoding utf8
+    Add-Content $PipelineFile "- [ ] $deadUrl2 | StubCo | Senior Security PM" -Encoding utf8
+    $env:CAREEROPS_WORKER_CMD         = $MixedWorker
+    $env:CAREEROPS_DIGEST_PREFIX_ARGS = "[$($DigestFailStub | ConvertTo-Json)]"
+    pwsh -NoProfile -File "$Root\run-nightly.ps1" -EvalOnly -MaxJobs 5 > "$Scratch\digestfail.log" 2>&1
+    $digestFailExit = $LASTEXITCODE
+    $digestFailLog  = Get-Content "$Scratch\digestfail.log" -Raw
+    $goodRow2 = (Get-Content $PipelineFile -Encoding utf8 | Where-Object { $_ -match [regex]::Escape($goodUrl2) })
+    $deadRow2 = (Get-Content $PipelineFile -Encoding utf8 | Where-Object { $_ -match [regex]::Escape($deadUrl2) })
+    Write-Host "    exit=$digestFailExit  good row: $goodRow2" -ForegroundColor DarkGray
+    Assert-True ($digestFailExit -eq 1) "digest failure during a partial batch exits 1, not 2 (got $digestFailExit)"
+    Assert-True ($digestFailLog -match 'Digest send failed') "the digest failure itself was logged"
+    Assert-True ($digestFailLog -match 'PARTIAL') "the partial-batch state was still logged, not dropped, despite the digest failure"
+    Assert-True ($goodRow2 -match '^\- \[x\]') "the live posting still drained to done despite the digest failure"
+    Assert-True ($deadRow2 -match '^\- \[!\]') "the dead posting is still recorded failed despite the digest failure"
+    Assert-True ((Get-Content $NeedsAttn -Raw) -match 'digest-send') "the digest failure landed a digest-send row in needs-attention"
+
+    # Restore the success stub so nothing downstream (if scenarios are ever
+    # reordered/added after this one) inherits a failing digest by accident.
+    $env:CAREEROPS_DIGEST_PREFIX_ARGS = "[$($DigestStub | ConvertTo-Json)]"
 }
 finally {
     Remove-Item Env:\CAREEROPS_WORKER_CMD          -ErrorAction SilentlyContinue

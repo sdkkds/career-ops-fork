@@ -86,6 +86,7 @@ $NeedsAttnFile = "$ProjectDir\data\needs-attention.md"
 $ScanSysFile   = "$ProjectDir\modes\scan.md"
 $MorningReview = "$VaultDir\morning-review.md"
 $DecisionsLog  = "$VaultDir\decisions.jsonl"
+$DigestCursor  = "$VaultDir\digest-cursor.json"
 $LockFile      = "$ProjectDir\batch\.nightly.pid"
 $InflightFile  = "$ProjectDir\batch\.nightly-inflight.json"
 $RunLog        = "$LogDir\nightly-$Date.log"
@@ -634,21 +635,31 @@ if ($verifyExit -ne 0) {
 # which is an empty placeholder in the project dir; passing the wrong path
 # here would make digest silently select nothing every night.
 #
-# --since $RunTimestamp scopes the digest to THIS run's decisions. Every
-# decision appended above shares evaluated_at == $RunTimestamp, and
-# decisions.jsonl is append-only and never pruned, so without --since the
-# digest would re-select and re-email every >=3.0 result from every past
-# night, forever, on every subsequent run.
+# --cursor persists the timestamp of the newest decision digest.mjs has
+# successfully digested, alongside decisions.jsonl in the vault. That is the
+# real selection boundary from the second run onward; --since $RunTimestamp
+# is used only as the bootstrap fallback before a cursor file exists, so the
+# very first run does not dump the entire history. Without a persisted
+# cursor, using $RunTimestamp every run would either (a) miss decisions from
+# a crashed prior run that never got digested, or (b) if reused across runs,
+# re-email the entire history forever, since decisions.jsonl is append-only
+# and never pruned.
 #
-# A send failure is treated the same as any other exit-1 condition on this
-# script: it means a human needs to look. It is NOT folded into exit 2
-# (reserved for the normal, low-urgency case of dead postings) because an
-# unnotified result is not a normal outcome — the operator could otherwise
+# A send (or read) failure is treated the same as any other exit-1 condition
+# on this script: it means a human needs to look. It is NOT folded into
+# exit 2 (reserved for the normal, low-urgency case of dead postings) because
+# an unnotified result is not a normal outcome — the operator could otherwise
 # miss a good match for weeks while believing they'd have heard about it.
-& node digest.mjs --file $DecisionsLog --needs-attention $NeedsAttnFile --since $RunTimestamp
-if ($LASTEXITCODE -ne 0) {
+#
+# The digest outcome is captured but NOT acted on immediately: the
+# partial/clean branching below must still run and log its own state (dead
+# postings vs. clean night) even when digest failed, so that information is
+# not silently dropped for this run. $digestExit overrides the exit code at
+# the very end instead.
+& node digest.mjs --file $DecisionsLog --needs-attention $NeedsAttnFile --cursor $DigestCursor --since $RunTimestamp
+$digestExit = $LASTEXITCODE
+if ($digestExit -ne 0) {
     Write-Log "Digest send failed — see $NeedsAttnFile" 'Red'
-    exit 1
 }
 
 # Reconciliation passed and the tracker merged. An unverified eval must never
@@ -663,8 +674,17 @@ if ($unverified -gt 0) {
         exit 1
     }
     Write-Log "PARTIAL: $completed of $evaluated eval(s) verified; $unverified could not be — see $NeedsAttnFile" 'Yellow'
+    if ($digestExit -ne 0) {
+        Write-Log "=== Done (partial batch AND digest failed — both need attention) ===" 'Red'
+        exit 1
+    }
     Write-Log "=== Done (partial) ===" 'Yellow'
     exit 2
+}
+
+if ($digestExit -ne 0) {
+    Write-Log "=== Done (digest failed) ===" 'Red'
+    exit 1
 }
 
 Write-Log "=== Done ===" 'Green'
