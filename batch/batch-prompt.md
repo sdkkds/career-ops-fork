@@ -505,7 +505,7 @@ CAREEROPS_RESULT_JSON_END
 
 `pdf_path_json_string_or_null` means either a properly JSON-encoded path string or the native JSON value `null` when no PDF was produced — never a path that does not exist; the orchestrator checks the file on disk and marks the run `failed` if the path is missing.
 
-On failure, emit the same block with `"status": "failed"`, `"score": null`, `"pdf": null`, and a populated `"error"`.
+On failure, emit the same block with `"status": "failed"`, `"score": null`, `"pdf": null`, and a populated `"error"`. When a failure occurs before the company or role can be determined (e.g., dead URL, unparseable JD), use `"company": "unknown"` and `"role": "unknown"`. When no report file was written, `"report"` may be `null`.
 
 **Rules:** `score` must be `null` when unscorable — never `0` as filler. Emit the block exactly once, as the last output.
 

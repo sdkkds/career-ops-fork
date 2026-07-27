@@ -50,3 +50,9 @@ test('empty or non-string input fails', () => {
   assert.equal(extractResultJson('').ok, false);
   assert.equal(extractResultJson(null).ok, false);
 });
+
+test('well-formed JSON in prose without a sentinel or fence is still a failure', () => {
+  const r = extractResultJson('Evaluated the role. {"status":"completed","score":5} nice job');
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /no result block/i);
+});
