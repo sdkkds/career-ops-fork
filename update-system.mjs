@@ -161,6 +161,7 @@ const SYSTEM_PATHS = [
   'match-star.mjs',
   'jd-skill-gap.mjs',
   'prepare-application.mjs',
+  'lib/',
   'providers/',
   'seeds/',
   'tests/',
