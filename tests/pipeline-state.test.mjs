@@ -52,6 +52,15 @@ test('parses attempts off the failed marker', () => {
   assert.equal(failed.attempts, 1);
 });
 
+test('title display does not leak attempts comment when comment abuts last data segment', () => {
+  // Row: - [!] https://x.test/j/4 | Delta | PM <!-- attempts:1 -->
+  // The attempts comment is directly attached to the title with no labeled segment between them.
+  const failed = parsePipeline(TEXT).find(e => e.state === 'failed');
+  assert.equal(failed.title, 'PM', 'title should not contain the HTML comment');
+  assert.equal(failed.company, 'Delta');
+  assert.equal(failed.attempts, 1);
+});
+
 test('setState rewrites only the matching line', () => {
   const next = setState(TEXT, 'https://x.test/j/1', 'in-progress');
   assert.match(next, /- \[~\] https:\/\/x\.test\/j\/1/);
