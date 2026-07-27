@@ -23,6 +23,7 @@ import { roleFuzzyMatch } from './role-matcher.mjs';
 import { LEGACY_COLMAP, detectColumns, resolveScoreStatus, normalizeVia } from './tracker-parse.mjs';
 import { resolveTrackerPath, trackerLockDirFor, acquireTrackerLock, writeFileAtomic, normalizeCompany, cell } from './tracker-utils.mjs';
 import { normalizeUrl } from './lib/url-identity.mjs';
+import { appendNeedsAttention } from './lib/needs-attention.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 // True only when this file is executed directly (`node merge-tracker.mjs` or
@@ -54,6 +55,12 @@ const ADDITIONS_DIR = process.env.CAREER_OPS_ADDITIONS
   ? process.env.CAREER_OPS_ADDITIONS
   : join(CAREER_OPS, 'batch/tracker-additions');
 const MERGED_DIR = join(ADDITIONS_DIR, 'merged');
+// CAREER_OPS_NEEDS_ATTENTION overrides the needs-attention log path (used by
+// tests, mirrors CAREER_OPS_TRACKER/CAREER_OPS_ADDITIONS) so test runs never
+// touch the real project's data/needs-attention.md.
+const NEEDS_ATTENTION_FILE = process.env.CAREER_OPS_NEEDS_ATTENTION
+  ? process.env.CAREER_OPS_NEEDS_ATTENTION
+  : join(CAREER_OPS, 'data/needs-attention.md');
 const DRY_RUN = process.argv.includes('--dry-run');
 const VERIFY = process.argv.includes('--verify');
 const MIGRATE = process.argv.includes('--migrate');
@@ -639,6 +646,24 @@ for (const file of tsvFiles) {
   const content = readFileSync(join(ADDITIONS_DIR, file), 'utf-8').trim();
   const addition = parseTsvContent(content, file);
   if (!addition) { skipped++; continue; }
+
+  // Visibility only — Task 5b. A missing/unparseable URL on the ADDITION
+  // itself (as opposed to the tracker lacking a URL column entirely, warned
+  // about below) means this row can't use the tier-0 URL dedup and falls back
+  // to the older heuristic tiers, exactly as it does today. This does not
+  // change that outcome — it only records it so a human can find and fix the
+  // source TSV. Distinct from the "tracker has no URL column" warning below:
+  // that one fires when addition.url IS present but the tracker can't store
+  // it; this one fires when the addition never had a usable URL to begin
+  // with, so the two never describe the same underlying situation.
+  if (!normalizeUrl(addition.url)) {
+    appendNeedsAttention(NEEDS_ATTENTION_FILE, {
+      url: addition.url || '',
+      stage: 'merge',
+      reason: `batch/tracker-additions/${file}: addition has no parseable URL — tier-0 URL dedup skipped, falling back to heuristic (report-number/company+role) matching`,
+      at: new Date().toISOString(),
+    });
+  }
 
   // A via= tag can only be stored if the tracker has a Via column — warn
   // instead of dropping the channel silently (#1596). Clear the value too:
