@@ -77,6 +77,49 @@ test('newestEvaluatedAt tracks the newest in-window timestamp, for cursor advanc
   assert.equal(heartbeat.newestEvaluatedAt, '2026-07-26 06:12');
 });
 
+// --- Round 2, finding 1: the cursor boundary record must not re-match forever ---
+
+test('feeding one run\'s newestEvaluatedAt as the next run\'s since selects zero items (no re-send of the boundary record)', () => {
+  const night1Lines = [
+    JSON.stringify({ status: 'completed', score: 4.2, company: 'Acme', role: 'Senior PM', url: 'https://x.test/1', evaluated_at: '2026-07-27 06:10' }),
+  ];
+  const night1 = selectDigest(night1Lines, { minScore: 3.0 });
+  assert.equal(night1.items.length, 1);
+  assert.equal(night1.heartbeat.newestEvaluatedAt, '2026-07-27 06:10');
+
+  // decisions.jsonl is append-only: night 2 re-reads the SAME line plus
+  // whatever else was appended. With only the boundary record present, the
+  // cursor from night 1 must exclude it, not re-match it forever.
+  // sinceExclusive:true is what the CLI passes when `since` came from a real
+  // persisted cursor (as opposed to the --since bootstrap fallback, which
+  // uses the opposite, inclusive boundary — see the two tests below).
+  const night2 = selectDigest(night1Lines, {
+    minScore: 3.0, since: night1.heartbeat.newestEvaluatedAt, sinceExclusive: true,
+  });
+  assert.equal(night2.items.length, 0, 'the record that set the cursor must not be re-selected on the next run');
+});
+
+test('the --since BOOTSTRAP fallback (sinceExclusive:false, the default) is inclusive: a record sharing the exact --since timestamp is still selected', () => {
+  // This is the shape of a run's OWN first-ever invocation: run-nightly.ps1
+  // passes --since $RunTimestamp as a fallback before any cursor exists, and
+  // every decision that run appends shares that exact evaluated_at. If this
+  // boundary were exclusive too, a run would filter out its own results on
+  // the very first night, which defeats the point of the fallback entirely.
+  const lines = [
+    JSON.stringify({ status: 'completed', score: 4.2, company: 'Acme', role: 'PM', url: 'https://x.test/1', evaluated_at: '2026-07-27 06:10' }),
+  ];
+  const { items } = selectDigest(lines, { minScore: 3.0, since: '2026-07-27 06:10' }); // sinceExclusive defaults false
+  assert.equal(items.length, 1, 'a record at exactly the bootstrap --since timestamp must still be selected');
+});
+
+test('a persisted cursor (sinceExclusive:true) is exclusive at the same boundary the bootstrap fallback is inclusive at', () => {
+  const lines = [
+    JSON.stringify({ status: 'completed', score: 4.2, company: 'Acme', role: 'PM', url: 'https://x.test/1', evaluated_at: '2026-07-27 06:10' }),
+  ];
+  const { items } = selectDigest(lines, { minScore: 3.0, since: '2026-07-27 06:10', sinceExclusive: true });
+  assert.equal(items.length, 0, 'a record at exactly the cursor timestamp must NOT be re-selected');
+});
+
 // --- Finding 1: an unreadable (not just missing) decisions file must fail loud ---
 
 test('readDecisionsFile returns [] when the file does not exist', () => {
@@ -97,24 +140,40 @@ test('readDecisionsFile throws (does not silently swallow) when the path is unre
 
 // --- Finding 2: durable cursor, so a crashed/failed digest doesn't drop results ---
 
-test('cursor round-trips: unset reads as null, then persists and reads back what was written', () => {
+test('cursor round-trips: no file reads as {since:null, corrupt:false} (legitimate bootstrap), then persists and reads back what was written', () => {
   const dir = mkdtempSync(join(tmpdir(), 'career-ops-digest-cursor-'));
   const cursorFile = join(dir, 'digest-cursor.json');
   try {
-    assert.equal(readCursor(cursorFile), null);
+    assert.deepEqual(readCursor(cursorFile), { since: null, corrupt: false });
     writeCursor(cursorFile, '2026-07-26 06:12');
-    assert.equal(readCursor(cursorFile), '2026-07-26 06:12');
+    assert.deepEqual(readCursor(cursorFile), { since: '2026-07-26 06:12', corrupt: false });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('a corrupt cursor file reads as null (safe fallback) rather than throwing', () => {
+// --- Round 2, finding 2: a corrupt cursor must be distinguishable from "no cursor yet" ---
+
+test('a corrupt (present but unparseable) cursor file reads as corrupt:true, NOT the same as a legitimate first run', () => {
   const dir = mkdtempSync(join(tmpdir(), 'career-ops-digest-cursor-'));
   const cursorFile = join(dir, 'digest-cursor.json');
   try {
     writeFileSync(cursorFile, '{ not valid json', 'utf-8');
-    assert.equal(readCursor(cursorFile), null);
+    const result = readCursor(cursorFile);
+    assert.equal(result.corrupt, true);
+    assert.notDeepEqual(result, { since: null, corrupt: false },
+      'corrupt-but-present must be distinguishable from genuinely absent — a caller that only checks `since === null` cannot tell them apart otherwise');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an empty cursor file (zero bytes) also reads as corrupt, not as a fresh bootstrap', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'career-ops-digest-cursor-'));
+  const cursorFile = join(dir, 'digest-cursor.json');
+  try {
+    writeFileSync(cursorFile, '', 'utf-8');
+    assert.equal(readCursor(cursorFile).corrupt, true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -141,6 +200,62 @@ test('CLI: an unreadable decisions file prints a heartbeat, records needs-attent
     assert.match(result.stdout, /"readError":true/, 'the heartbeat must name the failure as a read error');
     assert.ok(existsSync(needsAttentionFile), 'a needs-attention row must be recorded on a read failure');
     assert.match(readFileSync(needsAttentionFile, 'utf-8'), /digest-read/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Round 2, finding 2 (CLI integration): a corrupt cursor must not silently
+// drop pending decisions by degrading into an aggressive fresh-bootstrap window ---
+
+test('CLI: a corrupt cursor is surfaced (heartbeat + needs-attention) AND does not drop an older pending decision', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'career-ops-digest-cli-cursor-'));
+  const decisionsFile = join(dir, 'decisions.jsonl');
+  const needsAttentionFile = join(dir, 'needs-attention.md');
+  const cursorFile = join(dir, 'digest-cursor.json');
+  const sendStub = join(dir, 'send-stub.mjs');
+  try {
+    // An older, still-pending, never-digested decision — the kind of thing
+    // that would silently vanish if a corrupt cursor degraded into "treat
+    // this as a fresh bootstrap and use --since (tonight) instead."
+    writeFileSync(decisionsFile, JSON.stringify({
+      status: 'completed', score: 4.5, company: 'OldButPending', role: 'PM',
+      url: 'https://x.test/old', evaluated_at: '2026-07-20 00:00',
+    }) + '\n', 'utf-8');
+    writeFileSync(cursorFile, '{ this is not valid json', 'utf-8');
+    // No explicit exit call needed: node exits 0 on its own when a script
+    // runs to completion without throwing. (Spelling out that call literally
+    // in this file — even inside a string — would trip test-all.mjs's
+    // discovered-suite guard, which scans raw test-file text for that
+    // substring to keep a stray real call from silently truncating the
+    // whole in-process test run.)
+    writeFileSync(sendStub, 'console.log("stub send ok");', 'utf-8');
+
+    const result = spawnSync(process.execPath, [
+      DIGEST_MJS,
+      '--file', decisionsFile,
+      '--needs-attention', needsAttentionFile,
+      '--cursor', cursorFile,
+      // A recent bootstrap fallback: if the corrupt cursor were mishandled as
+      // a fresh bootstrap, this --since would wrongly exclude the older
+      // pending decision above.
+      '--since', '2026-07-27 00:00',
+    ], {
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        CAREEROPS_DIGEST_CMD: process.execPath,
+        CAREEROPS_DIGEST_PREFIX_ARGS: JSON.stringify([sendStub]),
+      },
+    });
+
+    assert.equal(result.status, 0, `expected a successful send, got status ${result.status}: ${result.stderr}`);
+    assert.match(result.stdout, /"cursorCorrupt":true/, 'the heartbeat must name the cursor as corrupt');
+    assert.match(result.stdout, /"evaluated":1/, 'the older pending decision must still be counted, not dropped');
+    assert.match(result.stdout, /"sendRequired":true/, 'the older pending decision must still be selected for sending, not dropped');
+    assert.match(result.stdout, /Sent 1 result/, 'the send must actually go out, proving the item reached renderDigest/execFileSync');
+    assert.ok(existsSync(needsAttentionFile), 'a needs-attention row must be recorded for the corrupt cursor');
+    assert.match(readFileSync(needsAttentionFile, 'utf-8'), /unreadable\/corrupt/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

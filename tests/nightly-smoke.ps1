@@ -356,6 +356,15 @@ try {
     $deadUrl2 = 'https://x.test/j/digestfail-dead'
     Add-Content $PipelineFile "- [ ] $goodUrl2 | StubCo | Senior Security PM" -Encoding utf8
     Add-Content $PipelineFile "- [ ] $deadUrl2 | StubCo | Senior Security PM" -Encoding utf8
+    # Reset the digest cursor before this scenario. Scenarios 7/9/10/12 above
+    # ran within the same wall-clock minute and each advanced the cursor on
+    # their own successful (stubbed) send, since $RunTimestamp is minute-
+    # granularity. Without this reset, this scenario's freshly-evaluated
+    # decision can share that same evaluated_at, get filtered out by the
+    # <= cursor comparison as "already digested," and never reach the send
+    # path at all — which would silently defeat this scenario's whole point
+    # (proving what happens when a send is actually attempted and fails).
+    Remove-Item (Join-Path $VaultStub 'digest-cursor.json') -Force -ErrorAction SilentlyContinue
     $env:CAREEROPS_WORKER_CMD         = $MixedWorker
     $env:CAREEROPS_DIGEST_PREFIX_ARGS = "[$($DigestFailStub | ConvertTo-Json)]"
     pwsh -NoProfile -File "$Root\run-nightly.ps1" -EvalOnly -MaxJobs 5 > "$Scratch\digestfail.log" 2>&1

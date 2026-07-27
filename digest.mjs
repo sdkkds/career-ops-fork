@@ -23,13 +23,27 @@
  * those results next time instead of silently dropping them. --since (passed
  * by the caller) is used only as the bootstrap fallback before a cursor
  * exists, so the very first run does not dump the entire history.
+ *
+ * The cursor value means "already digested through and including this
+ * timestamp" — selection therefore skips on <= since, not < since. (An
+ * earlier version used strict <, which meant the exact record that set the
+ * cursor kept re-matching on every subsequent run forever, since the cursor
+ * is always set to that record's own evaluated_at.)
+ *
+ * A cursor file that exists but cannot be read/parsed is NOT treated as "no
+ * cursor yet" — that would silently degrade into a fresh bootstrap and drop
+ * every decision between the last real cursor value and now, with the
+ * corrupt-file case indistinguishable from a legitimate first run. It is
+ * surfaced (heartbeat.cursorCorrupt, a needs-attention row) and resolved to
+ * the conservative (wider, not narrower) window: unfiltered, so a corrupt
+ * cursor risks a resend rather than a silent loss.
  */
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { basename } from 'node:path';
 import { appendNeedsAttention } from './lib/needs-attention.mjs';
 
-export function selectDigest(lines, { minScore = 3.0, since = null } = {}) {
+export function selectDigest(lines, { minScore = 3.0, since = null, sinceExclusive = false } = {}) {
   const heartbeat = {
     evaluated: 0, failed: 0, belowThreshold: 0, unparseable: 0, noTimestamp: 0,
     sendRequired: false, newestEvaluatedAt: null,
@@ -48,7 +62,22 @@ export function selectDigest(lines, { minScore = 3.0, since = null } = {}) {
       // so a malformed/legacy record is visible in the heartbeat instead of
       // silently swallowed in either direction.
       if (!r.evaluated_at) { heartbeat.noTimestamp++; continue; }
-      if (r.evaluated_at < since) continue;
+      // `since` has two different meanings depending on where it came from,
+      // and they need different boundary behavior at equality:
+      //
+      //   - sinceExclusive=true (a persisted CURSOR): "already digested
+      //     through and including this timestamp" -> skip on <=. Otherwise
+      //     the exact record that set the cursor keeps matching forever,
+      //     since the cursor is always set to that record's own
+      //     evaluated_at (round-2 finding 1).
+      //   - sinceExclusive=false (the --since BOOTSTRAP fallback, used only
+      //     before any cursor exists): "start counting from this timestamp,
+      //     inclusive" -> skip on <. The caller passes $RunTimestamp as
+      //     since, and this run's OWN freshly-appended decisions share that
+      //     exact timestamp -- <= would self-exclude every decision a run
+      //     produces on its own first-ever invocation, which is the
+      //     opposite of what the bootstrap fallback exists for.
+      if (sinceExclusive ? (r.evaluated_at <= since) : (r.evaluated_at < since)) continue;
     }
 
     heartbeat.evaluated++;
@@ -83,18 +112,22 @@ export function readDecisionsFile(file) {
   return readFileSync(file, 'utf-8').split('\n');
 }
 
-// Cursor is a tiny JSON file: { since, updated_at }. Corrupt/unreadable
-// cursors fail SAFE by falling back to the caller's --since bootstrap value
-// rather than crashing the whole digest over a damaged cursor file.
+// Cursor is a tiny JSON file: { since, updated_at }. Returns
+// { since, corrupt }. "No cursor file" (since=null, corrupt=false) is a
+// legitimate first-run bootstrap. "Cursor file present but unreadable or
+// unparseable" (since=null, corrupt=true) is NOT the same thing — that state
+// must be distinguishable so the caller can surface it instead of quietly
+// treating real, tracked progress as if it never existed.
 export function readCursor(cursorFile) {
+  if (!existsSync(cursorFile)) return { since: null, corrupt: false };
   try {
-    if (!existsSync(cursorFile)) return null;
     const raw = readFileSync(cursorFile, 'utf-8').trim();
-    if (!raw) return null;
+    if (!raw) return { since: null, corrupt: true };
     const obj = JSON.parse(raw);
-    return obj && typeof obj.since === 'string' ? obj.since : null;
+    if (obj && typeof obj.since === 'string') return { since: obj.since, corrupt: false };
+    return { since: null, corrupt: true };
   } catch {
-    return null;
+    return { since: null, corrupt: true };
   }
 }
 
@@ -142,19 +175,65 @@ if (process.argv[1] && basename(process.argv[1]) === 'digest.mjs') {
     process.exit(1);
   }
 
-  const persistedSince = readCursor(cursor);
-  const since = persistedSince || sinceFallback || null;
+  const cursorState = readCursor(cursor);
+  let since;
+  let sinceExclusive;
+  if (cursorState.corrupt) {
+    // Cursor file exists but could not be read/parsed. This is NOT "no
+    // cursor yet" — that would silently degrade into a fresh bootstrap and
+    // drop every decision between the last real cursor value and now, with
+    // no way to tell it apart from a legitimate first run. Surface it and
+    // fall back to the CONSERVATIVE (wider) window — unfiltered — so the
+    // failure mode is a resend, never a silent loss.
+    since = null;
+    sinceExclusive = false;
+    const reason = `digest cursor '${cursor}' exists but is unreadable/corrupt; ` +
+      `falling back to an unfiltered window to avoid silently dropping pending decisions`;
+    console.error(reason);
+    appendNeedsAttention(needsAttention, {
+      url: '', stage: 'digest-cursor', reason, at: new Date().toISOString(),
+    });
+  } else if (cursorState.since) {
+    // A real persisted cursor: "already digested through and including".
+    since = cursorState.since;
+    sinceExclusive = true;
+  } else {
+    // No cursor yet — bootstrap fallback: "start counting from here,
+    // inclusive," so this run's own decisions (which share this exact
+    // timestamp) are not self-excluded.
+    since = sinceFallback || null;
+    sinceExclusive = false;
+  }
 
-  const { items, heartbeat } = selectDigest(lines, { minScore: 3.0, since });
+  const { items, heartbeat } = selectDigest(lines, { minScore: 3.0, since, sinceExclusive });
+  heartbeat.cursorCorrupt = cursorState.corrupt;
 
   console.log(`HEARTBEAT ${JSON.stringify(heartbeat)}`);
 
+  // Cursor write failures are non-fatal to the run's exit code: whatever was
+  // sent (or the fact that nothing needed sending) is still true and correct.
+  // But a repeated write failure would otherwise present as mysterious
+  // duplicate emails with no way to diagnose why, so it's recorded — with
+  // fix-1's <= semantics, the NEXT run re-including already-digested results
+  // because of a stale cursor is the deliberately conservative outcome:
+  // duplicates over silence.
+  function advanceCursor() {
+    if (!heartbeat.newestEvaluatedAt) return;
+    try {
+      writeCursor(cursor, heartbeat.newestEvaluatedAt);
+    } catch (err) {
+      const reason = `digest could not advance cursor '${cursor}' to '${heartbeat.newestEvaluatedAt}': ` +
+        `${err.message} (next run will conservatively re-include already-digested results rather than silently dropping pending ones)`;
+      console.error(reason);
+      appendNeedsAttention(needsAttention, {
+        url: '', stage: 'digest-cursor-write', reason, at: new Date().toISOString(),
+      });
+    }
+  }
+
   if (!heartbeat.sendRequired) {
     console.log('Nothing to send — this is a legitimately empty night, not a failure.');
-    if (heartbeat.newestEvaluatedAt) {
-      try { writeCursor(cursor, heartbeat.newestEvaluatedAt); }
-      catch (err) { console.error(`digest: could not advance cursor: ${err.message}`); }
-    }
+    advanceCursor();
     process.exit(0);
   }
 
@@ -187,10 +266,7 @@ if (process.argv[1] && basename(process.argv[1]) === 'digest.mjs') {
       'gmail-send', '--subject', `career-ops: ${items.length} result(s) >= 3.0`, '--body', body,
     ], { stdio: 'inherit' });
     console.log(`Sent ${items.length} result(s).`);
-    if (heartbeat.newestEvaluatedAt) {
-      try { writeCursor(cursor, heartbeat.newestEvaluatedAt); }
-      catch (err) { console.error(`digest: could not advance cursor: ${err.message}`); }
-    }
+    advanceCursor();
   } catch (err) {
     const reason = `digest send failed: ${err.message}`;
     console.error(reason);
