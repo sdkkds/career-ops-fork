@@ -63,3 +63,43 @@ test('junk input is rejected without throwing', () => {
     assert.equal(classifyTitle(t).admit, false);
   }
 });
+
+// Second accept branch (2026-07-27 ruling): security-leadership titles carry
+// their own seniority, exactly like "Director of Product" does in the
+// pm-family branch — parallel to, not layered on top of, the pm-family gate.
+const SECURITY_LEADERSHIP_ADMIT = [
+  'Field CISO',
+  'Head of Security',
+  'Director of Cybersecurity',
+  'Director, Security',
+  'CISO',
+  'vCISO',
+  'VP Security',
+];
+
+test('admits security-leadership titles with no separate seniority word', () => {
+  for (const t of SECURITY_LEADERSHIP_ADMIT) {
+    const result = classifyTitle(t);
+    assert.equal(result.admit, true, `expected admit: ${t}`);
+    assert.equal(result.archetype, 'security-leadership', `expected security-leadership archetype: ${t}`);
+  }
+});
+
+test('archetype tags pm-family vs security-leadership distinctly', () => {
+  const pm = classifyTitle('Senior Product Manager, Security');
+  assert.equal(pm.admit, true);
+  assert.equal(pm.archetype, 'pm-family');
+  assert.equal(pm.securitySignal, true);
+
+  const leadership = classifyTitle('Director of Cybersecurity');
+  assert.equal(leadership.admit, true);
+  assert.equal(leadership.archetype, 'security-leadership');
+
+  const rejected = classifyTitle('Junior Product Manager');
+  assert.equal(rejected.admit, false);
+  assert.equal(rejected.archetype, null);
+});
+
+test('negative terms still block the security-leadership branch', () => {
+  assert.equal(classifyTitle('Junior CISO').admit, false);
+});
