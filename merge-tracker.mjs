@@ -55,12 +55,17 @@ const ADDITIONS_DIR = process.env.CAREER_OPS_ADDITIONS
   ? process.env.CAREER_OPS_ADDITIONS
   : join(CAREER_OPS, 'batch/tracker-additions');
 const MERGED_DIR = join(ADDITIONS_DIR, 'merged');
-// CAREER_OPS_NEEDS_ATTENTION overrides the needs-attention log path (used by
-// tests, mirrors CAREER_OPS_TRACKER/CAREER_OPS_ADDITIONS) so test runs never
-// touch the real project's data/needs-attention.md.
+// CAREER_OPS_NEEDS_ATTENTION overrides the needs-attention log path explicitly.
+// Otherwise it is derived from the RESOLVED TRACKER's directory, not from the
+// project root: upstream's own suites (tracker-columns-tests.mjs et al.) redirect
+// CAREER_OPS_TRACKER at a sandbox but know nothing about this variable, so a
+// project-root default made every test run append rows to the user's real
+// data/needs-attention.md — 9 rows per `node tracker-columns-tests.mjs`, ~1400
+// accumulated before it was caught. Following the tracker keeps a sandboxed
+// tracker's queue sandboxed automatically, with no cooperation from the caller.
 const NEEDS_ATTENTION_FILE = process.env.CAREER_OPS_NEEDS_ATTENTION
   ? process.env.CAREER_OPS_NEEDS_ATTENTION
-  : join(CAREER_OPS, 'data/needs-attention.md');
+  : join(TRACKER_DIR, 'needs-attention.md');
 const DRY_RUN = process.argv.includes('--dry-run');
 const VERIFY = process.argv.includes('--verify');
 const MIGRATE = process.argv.includes('--migrate');
