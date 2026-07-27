@@ -7,7 +7,10 @@
 // local-parser requires the script to live inside the project root and to be
 // the interpreter's first argument, and runs it with cwd pinned to the repo
 // root. It reads a JSON array (or {jobs:[]}) off stdout.
-const ROLE = 'Strategic Finance Manager';
+// Title carries a role + seniority term (task-8's classifyTitle gate runs
+// after title_filter in scan.mjs now) while keeping the "Strategic Finance"
+// substring so title_filter.positive in the test below still matches it.
+const ROLE = 'Senior Program Manager, Strategic Finance';
 
 console.log(JSON.stringify([
   { title: ROLE, url: 'https://boards.example.com/fixture/1001', company: 'Fixture Defense', location: 'Costa Mesa, CA' },

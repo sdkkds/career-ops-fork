@@ -44,6 +44,7 @@ import { classifyFetchError } from './verify-portals.mjs';
 import { fingerprintText, findCrossListings } from './fingerprint-core.mjs';
 import { resolveColumns, parseTrackerRow } from './tracker-parse.mjs';
 import { normalizeCompany } from './tracker-utils.mjs';
+import { classifyTitle } from './lib/filter.mjs';
 
 try {
   const { config } = await import('dotenv');
@@ -1753,6 +1754,8 @@ async function main() {
   const cooldownOffers = [];
   let totalFound = 0;
   let totalFilteredTitle = 0;
+  let totalFilteredGate = 0;
+  const gateSkippedOffers = [];
   let totalFilteredTier = 0;
   let totalFilteredLocation = 0;
   let totalFilteredPostingAge = 0;
@@ -1824,6 +1827,22 @@ async function main() {
 
         if (!titleFilter(job.title)) {
           totalFilteredTitle++;
+          continue;
+        }
+        // Role AND seniority admission gate (#task-8) — a second, stricter pass
+        // after the keyword title_filter above. Domain fit (security or
+        // otherwise) is judged at evaluation time, not here; securitySignal is
+        // recorded for scoring but never gates admission. Rejections are kept
+        // out of totalFilteredTitle (a distinct counter) and recorded to
+        // scan-history like every other skip reason so they're auditable and
+        // deduped on rescan.
+        const gate = classifyTitle(job.title);
+        if (!gate.admit) {
+          totalFilteredGate++;
+          gateSkippedOffers.push({
+            job: { ...job, source: sourceName },
+            status: gate.negative ? 'skipped_negative' : 'skipped_seniority',
+          });
           continue;
         }
         if (classifyTier && skipTiers.includes(classifyTier(job.title))) {
@@ -1974,6 +1993,19 @@ async function main() {
       appendToScanHistory(group, date, status);
     }
   }
+  // Role AND seniority gate rejections — recorded so a rejected posting is
+  // dedup-skipped on the next scan instead of being re-fetched and re-judged
+  // every run, and so every gate decision is auditable in scan-history.tsv.
+  if (!dryRun && gateSkippedOffers.length > 0) {
+    const byGateStatus = new Map();
+    for (const { job, status } of gateSkippedOffers) {
+      if (!byGateStatus.has(status)) byGateStatus.set(status, []);
+      byGateStatus.get(status).push(job);
+    }
+    for (const [status, group] of byGateStatus) {
+      appendToScanHistory(group, date, status);
+    }
+  }
 
   // 7. Print summary
   console.log(`\n${'━'.repeat(45)}`);
@@ -1985,6 +2017,7 @@ async function main() {
   if (summaryBoards > 0) console.log(`Job boards scanned:    ${summaryBoards}`);
   console.log(`Total jobs found:      ${totalFound}`);
   console.log(`Filtered by title:     ${totalFilteredTitle} removed`);
+  console.log(`Filtered by role/seniority gate: ${totalFilteredGate} removed`);
   if (skipTiers.length > 0) {
     console.log(`Filtered by tier:      ${totalFilteredTier} removed`);
   }
