@@ -76,3 +76,38 @@ test('a URL mismatch between orchestrator and worker is failed', () => {
   assert.equal(r.status, 'failed');
   assert.match(r.reasons.join(' '), /url/i);
 });
+
+test('a worker result that omits url entirely is failed, not silently passed', () => {
+  const root = fixture();
+  const r = verifyEval({ stdout: stdout({ status: 'completed', score: 4.2 }), root, expect: EXPECT });
+  assert.equal(r.status, 'failed');
+  assert.match(r.reasons.join(' '), /url/i);
+});
+
+test('a claimed PDF path that escapes the project root is failed, even if something exists there', () => {
+  const root = fixture();
+  const r = verifyEval({
+    stdout: stdout({ status: 'completed', score: 4.2, url: URL, pdf: '../../../../Windows/System32/notepad.exe' }),
+    root,
+    expect: EXPECT,
+  });
+  assert.equal(r.status, 'failed');
+  assert.match(r.reasons.join(' '), /pdf/i);
+});
+
+test('a non-completed status is failed even when report, TSV, score, and URL all check out', () => {
+  const root = fixture();
+  const r = verifyEval({ stdout: stdout({ status: 'error', score: 4.2, url: URL, error: 'model timeout' }), root, expect: EXPECT });
+  assert.equal(r.status, 'failed');
+  assert.match(r.reasons.join(' '), /status "error"/);
+});
+
+test('SKIP with null score verifies as completed; a non-SKIP status with null score does not (both halves pinned)', () => {
+  const root = fixture();
+  const skip = verifyEval({ stdout: stdout({ status: 'completed', score: null, tracker_status: 'SKIP', url: URL }), root, expect: EXPECT });
+  assert.equal(skip.status, 'completed', skip.reasons.join('; '));
+
+  const notSkip = verifyEval({ stdout: stdout({ status: 'completed', score: null, tracker_status: 'Evaluated', url: URL }), root, expect: EXPECT });
+  assert.equal(notSkip.status, 'failed');
+  assert.match(notSkip.reasons.join(' '), /score is null/i);
+});

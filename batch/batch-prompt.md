@@ -494,6 +494,7 @@ CAREEROPS_RESULT_JSON_BEGIN
   "company": "{company}",
   "role": "{role}",
   "score": {score_number},
+  "tracker_status": "{Evaluated|Applied|Responded|Interview|Offer|Rejected|Discarded|SKIP}",
   "legitimacy": "{High Confidence|Proceed with Caution|Suspicious}",
   "pdf": {pdf_path_json_string_or_null},
   "report": "{report_path}",
@@ -504,6 +505,8 @@ CAREEROPS_RESULT_JSON_END
 ```
 
 `pdf_path_json_string_or_null` means either a properly JSON-encoded path string or the native JSON value `null` when no PDF was produced — never a path that does not exist; the orchestrator checks the file on disk and marks the run `failed` if the path is missing.
+
+`tracker_status` is the canonical status (see `templates/states.yml`) the worker wrote into TSV column 5 — the same value, not a separate judgment call. This is how the orchestrator's success check (`lib/eval-verify.mjs`) tells a legitimate `SKIP` (null score by definition, still a completed evaluation) apart from a genuine scoring failure. Case is not significant to the reader, but always emit one of the canonical values verbatim.
 
 On failure, emit the same block with `"status": "failed"`, `"score": null`, `"pdf": null`, and a populated `"error"`. When a failure occurs before the company or role can be determined (e.g., dead URL, unparseable JD), use `"company": "unknown"` and `"role": "unknown"`. When no report file was written, `"report"` may be `null`.
 
