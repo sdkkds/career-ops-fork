@@ -266,6 +266,29 @@ function urlsConfirmedDifferent(additionUrl, appUrl) {
 }
 
 /**
+ * Whether a URL-less/unparseable addition should get a needs-attention row
+ * (Task 5b), kept mutually exclusive with the separate "tracker has no URL
+ * column" warning that fires later in the merge loop on
+ * `addition.url && COLMAP.url == null`.
+ *
+ * Exported as a pure predicate (mirrors findDuplicateByUrl above) specifically
+ * so the exclusivity can be pinned by a direct unit test: `parseTsvContent`'s
+ * URL-extraction (parseTsvExtras) only ever assigns `addition.url` a value
+ * that already passed `normalizeUrl`, so a real TSV file can never produce a
+ * truthy-but-unparseable `addition.url` today — the branch below exists to
+ * keep the two log lines exclusive if that ever changes, and a real TSV input
+ * can't exercise it end to end.
+ *
+ * @param {string} url - The addition's raw URL cell (may be '', valid, or garbage).
+ * @param {boolean} hasUrlColumn - Whether the live tracker has a URL column (COLMAP.url != null).
+ * @returns {boolean} True when this addition should get its own needs-attention row.
+ */
+export function needsAttentionForUnusableUrl(url, hasUrlColumn) {
+  const willWarnMissingColumn = Boolean(url) && !hasUrlColumn;
+  return !normalizeUrl(url) && !willWarnMissingColumn;
+}
+
+/**
  * Parse a score cell into a numeric value for score-upgrade decisions.
  *
  * The merge path compares old and new scores to decide whether to update an
@@ -652,17 +675,25 @@ for (const file of tsvFiles) {
   // about below) means this row can't use the tier-0 URL dedup and falls back
   // to the older heuristic tiers, exactly as it does today. This does not
   // change that outcome — it only records it so a human can find and fix the
-  // source TSV. Distinct from the "tracker has no URL column" warning below:
-  // that one fires when addition.url IS present but the tracker can't store
-  // it; this one fires when the addition never had a usable URL to begin
-  // with, so the two never describe the same underlying situation.
-  if (!normalizeUrl(addition.url)) {
-    appendNeedsAttention(NEEDS_ATTENTION_FILE, {
-      url: addition.url || '',
-      stage: 'merge',
-      reason: `batch/tracker-additions/${file}: addition has no parseable URL — tier-0 URL dedup skipped, falling back to heuristic (report-number/company+role) matching`,
-      at: new Date().toISOString(),
-    });
+  // source TSV. needsAttentionForUnusableUrl keeps this exclusive of the
+  // "tracker has no URL column" warning below (review finding #2).
+  if (needsAttentionForUnusableUrl(addition.url, COLMAP.url != null)) {
+    // A logging failure (permission error, missing data/ dir, disk full) must
+    // never abort the batch: writeFileAtomic(APPS_FILE, ...) only runs after
+    // this whole loop finishes, so an uncaught throw here would silently
+    // reject every other well-formed addition queued in the same run (review
+    // finding #1). Fail loud (console.error), not silent — but never let a
+    // side-channel write take down the merge it was only meant to annotate.
+    try {
+      appendNeedsAttention(NEEDS_ATTENTION_FILE, {
+        url: addition.url || '',
+        stage: 'merge',
+        reason: `batch/tracker-additions/${file}: addition has no parseable URL — tier-0 URL dedup skipped, falling back to heuristic (report-number/company+role) matching`,
+        at: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error(`❌ ${file}: failed to write needs-attention row (${err.message}) — continuing merge`);
+    }
   }
 
   // A via= tag can only be stored if the tracker has a Via column — warn
