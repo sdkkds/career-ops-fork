@@ -344,6 +344,12 @@ const USER_PATHS = [
   'plugins.lock',
   '.claude/settings.json',
   '.claude/hooks/',
+  // ── Local fork (sdkkds) — user-owned, never overwritten by an update ──
+  '.gitattributes',         // local: forces LF on *.sh so Git Bash can parse them
+  '.mcp.json',              // per-project MCP server config
+  'run-nightly.ps1',        // local PowerShell nightly orchestrator (no upstream counterpart)
+  'cv-beta.md',             // CV revision history
+  'cv-azure-gov-rewrite-proposed.md',
 ];
 
 function parseVersionFile(raw) {

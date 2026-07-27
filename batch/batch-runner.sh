@@ -558,11 +558,7 @@ process_offer() {
   # LOCAL HARDENING (kept across the v1.22 upgrade): upstream ships
   # --dangerously-skip-permissions here. Batch workers read untrusted job
   # postings, so they get an explicit allowlist instead of full tool access.
-  local -a claude_args=(
-    -p --strict-mcp-config
-    --allowedTools "Read,Write,Glob,Grep,WebFetch,WebSearch,Bash(node generate-pdf.mjs *)"
-    --permission-mode dontAsk
-  )
+  local -a claude_args=(-p --strict-mcp-config --permission-mode dontAsk --allowedTools "Read,Write,Glob,Grep,WebFetch,WebSearch,Bash(node generate-pdf.mjs *)")
   if [[ -n "$RESOLVED_MODEL" ]]; then
     claude_args+=(--model "$RESOLVED_MODEL")
   fi
