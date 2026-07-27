@@ -133,6 +133,7 @@ const SYSTEM_PATHS = [
   'lib/latex-content.mjs',
   'img-to-pdf.mjs',
   'archive-posting.mjs',
+  'archive-baseline.mjs',
   'application-answers.mjs',
   'generate-cover-letter.mjs',
   'merge-tracker.mjs',
@@ -350,6 +351,7 @@ const USER_PATHS = [
   'run-nightly.ps1',        // local PowerShell nightly orchestrator (no upstream counterpart)
   'cv-beta.md',             // CV revision history
   'cv-azure-gov-rewrite-proposed.md',
+  'qa-fixtures/',           // frozen QA data corpus — an update must never overwrite it
 ];
 
 function parseVersionFile(raw) {
