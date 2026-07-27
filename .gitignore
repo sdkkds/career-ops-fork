@@ -35,6 +35,11 @@ batch/batch-state.tsv
 batch/batch-input.tsv
 batch/tracker-additions/**/*.tsv
 !batch/tracker-additions/.gitkeep
+# run-nightly.ps1 runtime state: the PID lock and the in-progress ownership map.
+# Local to a single machine and meaningless anywhere else — and a committed PID
+# file would make the stale-lock branch act on another machine's process id.
+batch/.nightly.pid
+batch/.nightly-inflight.json
 jds/*
 !jds/.gitkeep
 

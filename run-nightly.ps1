@@ -21,6 +21,28 @@
 .PARAMETER MaxJobs    Max jobs to evaluate per run (default: 10).
 .PARAMETER DryRun     Print what would run without calling the worker or mutating state.
 
+.OUTPUTS
+  Exit codes — the scheduled task should distinguish these:
+
+    0  Success. Every dispatched eval was artifact-verified, or there was
+       nothing actionable to do.
+
+    2  Partial batch. At least one eval was verified AND at least one was not.
+       This is the normal outcome when some postings have gone dead: roughly a
+       third of scanned URLs go stale within weeks, so a run of 7 completed and
+       3 dead postings is a CORRECT run, not a broken one. Every unverified job
+       is already durably recorded (pipeline row '- [!]' with its attempt count,
+       a needs-attention row, and a decision line), so this code means "look at
+       needs-attention when convenient", not "something is broken".
+
+    1  Failure. The run itself is untrustworthy: a failed scan, a lost decision,
+       missing TSVs, merge-tracker or verify-pipeline errors, a report number
+       that could not be reserved, a pipeline marker that could not be written,
+       or a batch where NOTHING completed despite jobs being dispatched.
+
+  Conflating 2 with 1 is how gates get disabled: a scheduler that reports
+  failure every single night trains the owner to ignore it.
+
 .NOTES
   Test-only environment overrides (never set these in the scheduled task):
     CAREEROPS_WORKER_CMD  Command run instead of `claude` for evaluation. Lets
@@ -65,6 +87,7 @@ $ScanSysFile   = "$ProjectDir\modes\scan.md"
 $MorningReview = "$VaultDir\morning-review.md"
 $DecisionsLog  = "$VaultDir\decisions.jsonl"
 $LockFile      = "$ProjectDir\batch\.nightly.pid"
+$InflightFile  = "$ProjectDir\batch\.nightly-inflight.json"
 $RunLog        = "$LogDir\nightly-$Date.log"
 
 # Worker command. Defaults to the real thing; overridable only for tests.
@@ -140,6 +163,62 @@ function Set-PipelineState {
         Write-Log "FATAL: could not mark '$Url' as '$State' in $PipelineFile (exit $LASTEXITCODE). The queue and this run have diverged." 'Red'
         exit 1
     }
+}
+
+# ---- IN-FLIGHT OWNERSHIP ----
+#
+# Records which PID owns each in-progress row. The PID lock is a SOFT lock: the
+# operator is told to "Remove $LockFile to override", and the stale-lock branch
+# deletes it whenever Get-Process finds nothing for the recorded PID — which
+# also fires on PID reuse. So a second instance CAN start while a first is live.
+# Without ownership the reaper would then mark the first run's rows failed,
+# re-list them, and dispatch the same URL to a second paid worker while the
+# first run is still running. Mirrors gcStaleReportReservations' processIsAlive
+# check in reserve-report-num.mjs.
+#
+# Residual risk, same as upstream: a dead PID reused by an unrelated process
+# reads as alive, which is the safe direction (skip rather than double-dispatch).
+
+function Get-Inflight {
+    if (-not (Test-Path $InflightFile)) { return @{} }
+    $map = @{}
+    try {
+        $raw = Get-Content $InflightFile -Raw -Encoding utf8
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $map }
+        foreach ($p in ($raw | ConvertFrom-Json).PSObject.Properties) { $map[$p.Name] = $p.Value }
+    } catch {
+        Write-Log "WARN: could not read $InflightFile ($($_.Exception.Message)); treating all in-progress rows as unowned." 'Yellow'
+        return @{}
+    }
+    return $map
+}
+
+function Save-Inflight {
+    param($Map)
+    ($Map | ConvertTo-Json -Depth 5) | Set-Content $InflightFile -Encoding utf8
+}
+
+function Set-Inflight {
+    param([string]$Url)
+    $map = Get-Inflight
+    $map[$Url] = @{ pid = $PID; started = $RunTimestamp }
+    Save-Inflight $map
+}
+
+function Clear-Inflight {
+    param([string]$Url)
+    $map = Get-Inflight
+    if ($map.ContainsKey($Url)) { $map.Remove($Url); Save-Inflight $map }
+}
+
+# $true when another LIVE process claims this row.
+function Test-InflightOwnedByOther {
+    param($Map, [string]$Url)
+    if (-not $Map.ContainsKey($Url)) { return $false }
+    $ownerPid = Get-Prop $Map[$Url] 'pid'
+    if ($null -eq $ownerPid) { return $false }
+    if ([int]$ownerPid -eq $PID) { return $false }
+    return $null -ne (Get-Process -Id ([int]$ownerPid) -ErrorAction SilentlyContinue)
 }
 
 function Add-NeedsAttention {
@@ -249,20 +328,30 @@ if ($ScanOnly) {
 
 # Reap rows stranded in-progress by a previous crashed run. listActionable skips
 # in-progress deliberately (it means "a run owns this"), so without this step a
-# crash between the two marker writes would park the job forever. The PID lock
-# above guarantees no other run owns them right now.
+# crash between the two marker writes would park the job forever.
+#
+# The PID lock does NOT guarantee we are alone (see IN-FLIGHT OWNERSHIP above:
+# the operator may delete the lock, and the stale-lock branch removes it on PID
+# reuse). So reap only rows whose owning PID is gone. Reaping a row owned by a
+# live run would double-dispatch a paid worker and corrupt the queue.
 $staleJson = & node lib/pipeline-state.mjs --file $PipelineFile --list --state in-progress
 if ($LASTEXITCODE -ne 0) {
     Write-Log "FATAL: could not list in-progress jobs from $PipelineFile (exit $LASTEXITCODE)." 'Red'
     exit 1
 }
+$inflight = Get-Inflight
 foreach ($stale in @(($staleJson | Out-String) | ConvertFrom-Json)) {
+    if (Test-InflightOwnedByOther -Map $inflight -Url $stale.url) {
+        Write-Log "Leaving in-progress row alone — another live run owns it: $($stale.url)" 'Yellow'
+        continue
+    }
     if ($DryRun) {
         Write-Log "  [DRY RUN] Would recover job stranded in-progress: $($stale.url)" 'Yellow'
         continue
     }
     Write-Log "Recovering job stranded in-progress by an earlier run: $($stale.url)" 'Yellow'
     Set-PipelineState -Url $stale.url -State 'failed' -Attempts ([int]$stale.attempts + 1)
+    Clear-Inflight -Url $stale.url
     Add-NeedsAttention -Url $stale.url -Stage 'crash-recovery' -Reason 'left in-progress by a run that did not finish'
 }
 
@@ -312,12 +401,19 @@ foreach ($job in $jobs) {
     $resolvedPath = "$ProjectDir\batch\.resolved-nightly-$idx.md"
     $logFile      = "$LogDir\$reportNum-nightly-$idx.log"
 
-    # Phase 1 of the drain marker: recorded BEFORE dispatch, so a crash mid-eval
-    # leaves the row as in-progress rather than looking pending forever.
-    Set-PipelineState -Url $jobUrl -State 'in-progress'
-
     $r = $null
     try {
+        # Phase 1 of the drain marker: recorded BEFORE dispatch, so a crash
+        # mid-eval leaves the row as in-progress rather than looking pending
+        # forever. This sits INSIDE the try: Set-PipelineState exits on a
+        # divergent queue, and PowerShell runs finally on exit, so the
+        # reservation sentinel is released on that path too. Reserving outside
+        # this block would leak reports/NNN-RESERVED.md, and since nothing calls
+        # --gc, verify-pipeline's stale-sentinel check would then fail every
+        # subsequent run until someone cleaned up by hand.
+        Set-Inflight -Url $jobUrl
+        Set-PipelineState -Url $jobUrl -State 'in-progress'
+
         $resolved = Resolve-BatchPrompt $jobUrl $jdFile $reportNum $Date $id
         $resolved | Out-File $resolvedPath -Encoding utf8
 
@@ -411,7 +507,13 @@ foreach ($job in $jobs) {
     } finally {
         # Always drop the reservation sentinel. On success the real report file
         # now occupies the number; on failure the number is free to reuse.
+        # The release takes the tracker lock (60s timeout) — a timeout or a
+        # mismatch fails silently and strands the sentinel, which surfaces much
+        # later as a verify-pipeline error pointing nowhere near the cause.
         & node reserve-report-num.mjs --release $reportNum | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "WARN: could not release report reservation $reportNum (exit $LASTEXITCODE). reports/$reportNum-RESERVED.md may be stranded; run 'node reserve-report-num.mjs --gc'." 'Yellow'
+        }
         Remove-Item $resolvedPath -Force -ErrorAction SilentlyContinue
     }
 
@@ -432,6 +534,8 @@ foreach ($job in $jobs) {
         Set-PipelineState -Url $jobUrl -State 'failed' -Attempts ([int]$job.attempts + 1)
         Add-NeedsAttention -Url $jobUrl -Stage 'eval' -Reason $r.error
     }
+    # The row now has a terminal marker; this run no longer owns it.
+    Clear-Inflight -Url $jobUrl
 
     $statusTag = if ($r.status -eq 'completed') { 'OK  ' } else { 'FAIL' }
     $scoreTag  = if ($null -ne $r.score) { "$($r.score)/5" } else { '?' }
@@ -519,12 +623,20 @@ if ($verifyExit -ne 0) {
     exit 1
 }
 
-# Reconciliation passed and the tracker merged, but an unverified eval must
-# never let the run report success.
+# Reconciliation passed and the tracker merged. An unverified eval must never
+# read as a clean success — but "some postings were dead" is not the same event
+# as "this run is broken", and giving them the same exit code trains the owner
+# to ignore both. See the exit-code contract in the header.
 $unverified = $evaluated - $completed
 if ($unverified -gt 0) {
-    Write-Log "FAIL: $unverified of $evaluated eval(s) could not be verified — see $NeedsAttnFile" 'Red'
-    exit 1
+    if ($completed -eq 0) {
+        # Nothing at all worked. That is a broken run, not a stale-posting run.
+        Write-Log "FATAL: all $evaluated eval(s) failed — nothing completed. See $NeedsAttnFile" 'Red'
+        exit 1
+    }
+    Write-Log "PARTIAL: $completed of $evaluated eval(s) verified; $unverified could not be — see $NeedsAttnFile" 'Yellow'
+    Write-Log "=== Done (partial) ===" 'Yellow'
+    exit 2
 }
 
 Write-Log "=== Done ===" 'Green'

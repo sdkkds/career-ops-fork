@@ -100,7 +100,23 @@ Write-Output "CAREEROPS_RESULT_JSON_END"
 exit 0
 '@ | Set-Content $GoodWorker -Encoding utf8
 
+# Stub C: succeeds for URLs containing "good", fails for everything else. Used
+# to produce a genuinely mixed batch — the normal nightly outcome once some
+# postings have gone dead.
+$MixedWorker = Join-Path $Scratch 'mixed-worker.ps1'
+@'
+param()
+$all = $args -join ' '
+$url = [regex]::Match($all, 'URL:\s*(\S+)').Groups[1].Value
+if ($url -notmatch 'good') {
+    Write-Output "This posting appears to be gone. { no json here }"
+    exit 0
+}
+& (Join-Path $env:CAREEROPS_SMOKE_SCRATCH 'good-worker.ps1') @args
+'@ | Set-Content $MixedWorker -Encoding utf8
+
 $Tracker        = "$Root\data\applications.md"
+$InflightFile   = "$Root\batch\.nightly-inflight.json"
 $pipelineBackup = Get-Content $PipelineFile -Raw -Encoding utf8
 $trackerBackup  = Get-Content $Tracker -Raw -Encoding utf8
 $needsBackup    = if (Test-Path $NeedsAttn) { Get-Content $NeedsAttn -Raw -Encoding utf8 } else { $null }
@@ -138,7 +154,9 @@ try {
     Write-Host "    decisions    : $($decisions.Count) line(s)" -ForegroundColor DarkGray
     if ($decisions.Count -gt 0) { Write-Host "    decision[0]  : $($decisions[0])" -ForegroundColor DarkGray }
 
-    Assert-True ($runExit -ne 0) "run exited non-zero (got $runExit)"
+    # Exit-code contract: nothing completed, so this is a broken run (1), not a
+    # partial batch (2).
+    Assert-True ($runExit -eq 1) "run exited 1 — nothing completed (got $runExit)"
     Assert-True ($null -ne $row) "the CRLF-written pipeline row was seen at all"
     Assert-True ($row -match '^\- \[!\]') "pipeline row ends as failed '- [!]'"
     Assert-True ($row -match '<!-- attempts:1 -->') "pipeline row records attempts:1"
@@ -161,7 +179,7 @@ try {
     $retryExit = $LASTEXITCODE
     $row2 = (Get-Content $PipelineFile -Encoding utf8 | Where-Object { $_ -match [regex]::Escape($url) })
     Write-Host "    pipeline row : $row2" -ForegroundColor DarkGray
-    Assert-True ($retryExit -ne 0) "retry run also exited non-zero (got $retryExit)"
+    Assert-True ($retryExit -eq 1) "retry run also exited 1 (got $retryExit)"
     Assert-True ($row2 -match '<!-- attempts:2 -->') "attempts advanced 1 -> 2, budget is not stuck"
 
     Write-Host "6. Retry budget exhausted: the row is no longer actionable" -ForegroundColor Cyan
@@ -181,6 +199,7 @@ try {
     Add-Content $PipelineFile "- [ ] $okUrl | StubCo | Senior Security PM" -Encoding utf8
     $env:CAREEROPS_WORKER_CMD    = $GoodWorker
     $env:CAREEROPS_SMOKE_ROOT    = $Root
+    $env:CAREEROPS_SMOKE_SCRATCH = $Scratch
 
     pwsh -NoProfile -File "$Root\run-nightly.ps1" -EvalOnly -MaxJobs 1 | Out-Null
     $okExit = $LASTEXITCODE
@@ -214,7 +233,7 @@ try {
     $errExit = $LASTEXITCODE
     $errRow = (Get-Content $PipelineFile -Encoding utf8 | Where-Object { $_ -match [regex]::Escape($errUrl) })
     Write-Host "    pipeline row : $errRow" -ForegroundColor DarkGray
-    Assert-True ($errExit -ne 0) "run with a missing worker exited non-zero (got $errExit)"
+    Assert-True ($errExit -eq 1) "run with a missing worker exited 1 (got $errExit)"
     Assert-True ($errRow -match '^\- \[!\]') "row ended failed, not stranded in-progress"
     Assert-True ((Get-Content $NeedsAttn -Raw) -match [regex]::Escape($errUrl)) "the error was recorded in needs-attention"
     Assert-True (@(Get-ChildItem "$Root\reports" -Filter '*-RESERVED.md' -ErrorAction SilentlyContinue).Count -eq 0) `
@@ -234,11 +253,80 @@ try {
     Assert-True ($crashRow -notmatch '^\- \[~\]') "the stranded row did not stay in-progress"
     Assert-True ((Get-Content $NeedsAttn -Raw) -match 'crash-recovery') "the reaper logged a crash-recovery row"
     Assert-True ($crashRow -match '^\- \[x\]') "the reaped row was retried and completed"
+
+    Write-Host "10. Mixed batch: some verified, some dead -> exit 2, not exit 1" -ForegroundColor Cyan
+    # The realistic nightly shape. Roughly a third of scanned URLs go stale, so
+    # a run of "most completed, some dead" is CORRECT and must be
+    # distinguishable from a broken run, or the owner learns to ignore the gate.
+    $goodUrl = 'https://x.test/j/mixed-good'
+    $deadUrl = 'https://x.test/j/mixed-dead'
+    Add-Content $PipelineFile "- [ ] $goodUrl | StubCo | Senior Security PM" -Encoding utf8
+    Add-Content $PipelineFile "- [ ] $deadUrl | StubCo | Senior Security PM" -Encoding utf8
+    $env:CAREEROPS_WORKER_CMD = $MixedWorker
+    pwsh -NoProfile -File "$Root\run-nightly.ps1" -EvalOnly -MaxJobs 5 | Out-Null
+    $mixedExit = $LASTEXITCODE
+    $goodRow = (Get-Content $PipelineFile -Encoding utf8 | Where-Object { $_ -match [regex]::Escape($goodUrl) })
+    $deadRow = (Get-Content $PipelineFile -Encoding utf8 | Where-Object { $_ -match [regex]::Escape($deadUrl) })
+    Write-Host "    good row     : $goodRow" -ForegroundColor DarkGray
+    Write-Host "    dead row     : $deadRow" -ForegroundColor DarkGray
+    Assert-True ($mixedExit -eq 2) "partial batch exited 2, not 1 (got $mixedExit)"
+    Assert-True ($goodRow -match '^\- \[x\]') "the live posting drained to done"
+    Assert-True ($deadRow -match '^\- \[!\]') "the dead posting is recorded failed"
+    Assert-True ((Get-Content $NeedsAttn -Raw) -match [regex]::Escape($deadUrl)) "the dead posting is in needs-attention"
+
+    Write-Host "11. Reservation is released when the in-progress marker fails" -ForegroundColor Cyan
+    # Regression guard: the report number is reserved before the marker write.
+    # If that write fails (queue/run divergence), Set-PipelineState exits, and
+    # PowerShell runs finally on exit — so the sentinel must still be released.
+    # A leaked reports/NNN-RESERVED.md would fail verify-pipeline's stale-sentinel
+    # check on EVERY subsequent run, since nothing calls --gc.
+    $lockUrl = 'https://x.test/j/marker-fail'
+    Add-Content $PipelineFile "- [ ] $lockUrl | StubCo | Senior Security PM" -Encoding utf8
+    $env:CAREEROPS_WORKER_CMD = $GoodWorker
+    Set-ItemProperty -Path $PipelineFile -Name IsReadOnly -Value $true
+    try {
+        pwsh -NoProfile -File "$Root\run-nightly.ps1" -EvalOnly -MaxJobs 1 | Out-Null
+        $lockExit = $LASTEXITCODE
+    } finally {
+        Set-ItemProperty -Path $PipelineFile -Name IsReadOnly -Value $false
+    }
+    $sentinels = @(Get-ChildItem "$Root\reports" -Filter '*-RESERVED.md' -ErrorAction SilentlyContinue)
+    Write-Host "    exit=$lockExit sentinels=$($sentinels.Count)" -ForegroundColor DarkGray
+    Assert-True ($lockExit -eq 1) "an unwritable pipeline is fatal (got $lockExit)"
+    Assert-True ($sentinels.Count -eq 0) "no reservation sentinel leaked on the marker-failure path"
+
+    Write-Host "12. Reaper leaves alone rows owned by a live process" -ForegroundColor Cyan
+    # The PID lock is soft: the operator is told to delete it to override, and
+    # the stale-lock branch removes it on PID reuse. If a second instance starts
+    # while a first is live, reaping the first run's rows would dispatch the same
+    # URL to a second PAID worker and let two runs fight over the marker.
+    $ownedUrl = 'https://x.test/j/owned-by-live'
+    Add-Content $PipelineFile "- [ ] $ownedUrl | StubCo | Senior Security PM" -Encoding utf8
+    node lib/pipeline-state.mjs --file data\pipeline.md --url $ownedUrl --state in-progress | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "could not stage the owned in-progress row" }
+    # $PID here is this test process, which stays alive for the whole child run.
+    @{ $ownedUrl = @{ pid = $PID; started = 'smoke' } } | ConvertTo-Json -Depth 5 |
+        Set-Content $InflightFile -Encoding utf8
+
+    $env:CAREEROPS_WORKER_CMD = $GoodWorker
+    pwsh -NoProfile -File "$Root\run-nightly.ps1" -EvalOnly -MaxJobs 5 > "$Scratch\owned.log" 2>&1
+    $ownedExit = $LASTEXITCODE
+    $ownedRow = (Get-Content $PipelineFile -Encoding utf8 | Where-Object { $_ -match [regex]::Escape($ownedUrl) })
+    Write-Host "    pipeline row : $ownedRow" -ForegroundColor DarkGray
+    Assert-True ($ownedRow -match '^\- \[~\]') "row owned by a live PID stayed in-progress, not reaped"
+    Assert-True ((Get-Content "$Scratch\owned.log" -Raw) -match 'another live run owns it') `
+                "the skip was logged"
+    Assert-True ($ownedExit -eq 0) "nothing else was actionable, so the run exited 0 (got $ownedExit)"
+    Assert-True ((Get-Content $NeedsAttn -Raw) -notmatch [regex]::Escape($ownedUrl)) `
+                "no crash-recovery row was written for the live-owned job"
 }
 finally {
-    Remove-Item Env:\CAREEROPS_WORKER_CMD -ErrorAction SilentlyContinue
-    Remove-Item Env:\CAREEROPS_VAULT_DIR  -ErrorAction SilentlyContinue
-    Remove-Item Env:\CAREEROPS_SMOKE_ROOT -ErrorAction SilentlyContinue
+    Remove-Item Env:\CAREEROPS_WORKER_CMD    -ErrorAction SilentlyContinue
+    Remove-Item Env:\CAREEROPS_VAULT_DIR     -ErrorAction SilentlyContinue
+    Remove-Item Env:\CAREEROPS_SMOKE_ROOT    -ErrorAction SilentlyContinue
+    Remove-Item Env:\CAREEROPS_SMOKE_SCRATCH -ErrorAction SilentlyContinue
+    if (Test-Path $PipelineFile) { Set-ItemProperty -Path $PipelineFile -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue }
+    Remove-Item $InflightFile -Force -ErrorAction SilentlyContinue
     Set-Content $PipelineFile -Value $pipelineBackup -NoNewline -Encoding utf8
     Set-Content $Tracker      -Value $trackerBackup  -NoNewline -Encoding utf8
     if ($null -ne $needsBackup) { Set-Content $NeedsAttn -Value $needsBackup -NoNewline -Encoding utf8 }
