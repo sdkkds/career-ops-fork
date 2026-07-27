@@ -103,3 +103,37 @@ test('archetype tags pm-family vs security-leadership distinctly', () => {
 test('negative terms still block the security-leadership branch', () => {
   assert.equal(classifyTitle('Junior CISO').admit, false);
 });
+
+// 2026-07-27 review round: three substring/coverage defects reproduced by the
+// reviewer directly. `intern`/`associate` were matching (or, for `associate`,
+// correctly matching but too bluntly) in ways that rejected real senior
+// titles; `cso`/"Chief Security Officer" were missing from the
+// security-leadership branch entirely.
+test('word-boundary and coverage fixes recover real senior titles', () => {
+  const cases = [
+    ['Senior International Program Manager', 'pm-family'],   // 'intern' inside "International"
+    ['VP, International Security Programs', 'security-leadership'], // 'intern' inside "International" + role-word/security composition
+    ['Associate Director of Product', 'pm-family'],          // 'associate' modifying an already-senior title
+    ['Associate CISO', 'security-leadership'],                // ditto — this user's own named target archetype
+    ['Chief Security Officer', 'security-leadership'],        // missing self-term, now added
+  ];
+  for (const [t, archetype] of cases) {
+    const result = classifyTitle(t);
+    assert.equal(result.admit, true, `expected admit: ${t}`);
+    assert.equal(result.archetype, archetype, `expected archetype ${archetype} for: ${t}`);
+  }
+});
+
+test('the associate fix does not blanket-admit genuinely junior titles', () => {
+  // "Associate Product Manager" (IC-level, no senior-title modifier) must
+  // still reject — only "associate <senior title>" compounds are exempted.
+  const rejected = classifyTitle('Associate Product Manager');
+  assert.equal(rejected.admit, false);
+  assert.equal(rejected.negative, 'associate');
+});
+
+test('Deputy CISO is unaffected by the associate/intern fixes', () => {
+  const result = classifyTitle('Deputy CISO');
+  assert.equal(result.admit, true);
+  assert.equal(result.archetype, 'security-leadership');
+});
