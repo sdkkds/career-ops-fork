@@ -194,6 +194,7 @@ const SYSTEM_PATHS = [
   'openai-eval.mjs',
   'openai-tailor.mjs',
   'eval-golden.mjs',
+  'digest.mjs',
   'evals/',
   'openrouter-runner.mjs',
   'test-all.mjs',

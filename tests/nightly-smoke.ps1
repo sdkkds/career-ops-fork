@@ -115,6 +115,22 @@ if ($url -notmatch 'good') {
 & (Join-Path $env:CAREEROPS_SMOKE_SCRATCH 'good-worker.ps1') @args
 '@ | Set-Content $MixedWorker -Encoding utf8
 
+# Digest send stub. From scenario 7 onward the good/mixed workers produce a
+# completed eval scoring 4.2, which now triggers run-nightly.ps1's digest
+# step. digest.mjs must NEVER be allowed to shell out to the real `gws`
+# during a test run, so point it at a trivial node script via the same
+# test-only override pattern as CAREEROPS_WORKER_CMD (see digest.mjs's
+# CAREEROPS_DIGEST_CMD / CAREEROPS_DIGEST_PREFIX_ARGS). Node itself is
+# always directly spawnable on Windows (no .cmd/.bat shell requirement),
+# which is why the stub is a .mjs file rather than a .ps1.
+$DigestStub = Join-Path $Scratch 'digest-stub.mjs'
+@'
+console.log("digest stub: pretending to send");
+process.exit(0);
+'@ | Set-Content $DigestStub -Encoding utf8
+$env:CAREEROPS_DIGEST_CMD         = 'node'
+$env:CAREEROPS_DIGEST_PREFIX_ARGS = "[$($DigestStub | ConvertTo-Json)]"
+
 $Tracker        = "$Root\data\applications.md"
 $InflightFile   = "$Root\batch\.nightly-inflight.json"
 $pipelineBackup = Get-Content $PipelineFile -Raw -Encoding utf8
@@ -321,10 +337,12 @@ try {
                 "no crash-recovery row was written for the live-owned job"
 }
 finally {
-    Remove-Item Env:\CAREEROPS_WORKER_CMD    -ErrorAction SilentlyContinue
-    Remove-Item Env:\CAREEROPS_VAULT_DIR     -ErrorAction SilentlyContinue
-    Remove-Item Env:\CAREEROPS_SMOKE_ROOT    -ErrorAction SilentlyContinue
-    Remove-Item Env:\CAREEROPS_SMOKE_SCRATCH -ErrorAction SilentlyContinue
+    Remove-Item Env:\CAREEROPS_WORKER_CMD          -ErrorAction SilentlyContinue
+    Remove-Item Env:\CAREEROPS_VAULT_DIR           -ErrorAction SilentlyContinue
+    Remove-Item Env:\CAREEROPS_SMOKE_ROOT          -ErrorAction SilentlyContinue
+    Remove-Item Env:\CAREEROPS_SMOKE_SCRATCH       -ErrorAction SilentlyContinue
+    Remove-Item Env:\CAREEROPS_DIGEST_CMD          -ErrorAction SilentlyContinue
+    Remove-Item Env:\CAREEROPS_DIGEST_PREFIX_ARGS  -ErrorAction SilentlyContinue
     if (Test-Path $PipelineFile) { Set-ItemProperty -Path $PipelineFile -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue }
     Remove-Item $InflightFile -Force -ErrorAction SilentlyContinue
     Set-Content $PipelineFile -Value $pipelineBackup -NoNewline -Encoding utf8

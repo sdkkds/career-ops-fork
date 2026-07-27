@@ -623,6 +623,34 @@ if ($verifyExit -ne 0) {
     exit 1
 }
 
+# ---- DIGEST ----
+#
+# Placed after verify-pipeline succeeds (so digest only ever reads a tracker
+# state that has already been reconciled) and before the partial/clean exit
+# branching below (so it runs whether tonight ends up exit 0 or exit 2 —
+# both are "the run is trustworthy", which is the only precondition digest
+# needs). Reads $DecisionsLog directly since that is where evaluations are
+# actually appended (see EVALUATE phase above) — NOT data/decisions.jsonl,
+# which is an empty placeholder in the project dir; passing the wrong path
+# here would make digest silently select nothing every night.
+#
+# --since $RunTimestamp scopes the digest to THIS run's decisions. Every
+# decision appended above shares evaluated_at == $RunTimestamp, and
+# decisions.jsonl is append-only and never pruned, so without --since the
+# digest would re-select and re-email every >=3.0 result from every past
+# night, forever, on every subsequent run.
+#
+# A send failure is treated the same as any other exit-1 condition on this
+# script: it means a human needs to look. It is NOT folded into exit 2
+# (reserved for the normal, low-urgency case of dead postings) because an
+# unnotified result is not a normal outcome — the operator could otherwise
+# miss a good match for weeks while believing they'd have heard about it.
+& node digest.mjs --file $DecisionsLog --needs-attention $NeedsAttnFile --since $RunTimestamp
+if ($LASTEXITCODE -ne 0) {
+    Write-Log "Digest send failed — see $NeedsAttnFile" 'Red'
+    exit 1
+}
+
 # Reconciliation passed and the tracker merged. An unverified eval must never
 # read as a clean success — but "some postings were dead" is not the same event
 # as "this run is broken", and giving them the same exit code trains the owner
