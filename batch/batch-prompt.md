@@ -482,43 +482,32 @@ Use `{{REPORT_NUM}}` as the tracker `num`. The batch coordinator reserves this n
 
 Build the final payload as an object and print it with `JSON.stringify` (or an equivalent JSON serializer). Never assemble JSON by interpolating raw strings. Every dynamic string value, including company, role, paths, and error text, must be escaped by the serializer.
 
-Success:
+When finished, print the summary JSON to stdout **between these exact sentinel lines**. The orchestrator reads only what sits between them; prose outside is ignored, and if the sentinels are missing the evaluation is recorded as `failed`.
 
-```json
+```
+CAREEROPS_RESULT_JSON_BEGIN
 {
   "status": "completed",
   "id": "{{ID}}",
   "report_num": "{{REPORT_NUM}}",
+  "url": "{{URL}}",
   "company": "{company}",
   "role": "{role}",
-  "score": {score_num},
+  "score": {score_number},
   "legitimacy": "{High Confidence|Proceed with Caution|Suspicious}",
   "pdf": {pdf_path_json_string_or_null},
   "report": "{report_path}",
+  "tsv": "batch/tracker-additions/{{REPORT_NUM}}-{{ID}}.tsv",
   "error": null
 }
+CAREEROPS_RESULT_JSON_END
 ```
 
-`pdf_path_json_string_or_null` means either a properly JSON-encoded path string or the native JSON value `null`; never emit the string `"null"`.
+`pdf_path_json_string_or_null` means either a properly JSON-encoded path string or the native JSON value `null` when no PDF was produced — never a path that does not exist; the orchestrator checks the file on disk and marks the run `failed` if the path is missing.
 
-Failure:
+On failure, emit the same block with `"status": "failed"`, `"score": null`, `"pdf": null`, and a populated `"error"`.
 
-```json
-{
-  "status": "failed",
-  "id": "{{ID}}",
-  "report_num": "{{REPORT_NUM}}",
-  "company": "{company_or_unknown}",
-  "role": "{role_or_unknown}",
-  "score": null,
-  "legitimacy": null,
-  "pdf": null,
-  "report": {report_path_json_string_or_null},
-  "error": "{error_description}"
-}
-```
-
-`report_path_json_string_or_null` means either a properly JSON-encoded path string or the native JSON value `null` when no report exists.
+**Rules:** `score` must be `null` when unscorable — never `0` as filler. Emit the block exactly once, as the last output.
 
 ---
 
