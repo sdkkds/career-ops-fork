@@ -276,3 +276,14 @@ test('status selection distinguishes skipped_role vs skipped_seniority vs skippe
   const unqualifiedNoSeniority = classifyTitle('Worldwide Specialist Solutions Architect - Agentic Development');
   assert.equal(gateStatusFor(unqualifiedNoSeniority), 'skipped_role');
 });
+
+test('the security signal does not fire on "soc" hiding inside "associate"', () => {
+  // 'soc' is a substring of "asSOCiate". Before word-boundary matching, an
+  // "Associate Director of Product" — which admits via the senior-compound
+  // exception — carried securitySignal=true into scoring as a general PM role.
+  assert.equal(classifyTitle('Associate Director of Product').securitySignal, false);
+  assert.equal(classifyTitle('Associate VP, Product Management').securitySignal, false);
+  // The real SOC sense must survive.
+  assert.equal(classifyTitle('Director, Security Operations Center (SOC)').securitySignal, true);
+  assert.equal(classifyTitle('Senior Program Manager, SOC Automation').securitySignal, true);
+});
