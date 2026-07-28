@@ -1587,6 +1587,20 @@ function guardStatusFor(code) {
   return 'skipped_invalid_url';
 }
 
+// gateStatusFor maps a classifyTitle() rejection to the canonical
+// scan-history status string. Only called when gate.admit is false.
+// Negatives take precedence (as before); otherwise the reason is read off
+// classifyTitle's own fields rather than collapsed into one bucket: a title
+// with no role term at all ("Principal AI Security Specialist", "Sr.
+// Solutions Architect, AWS" pre-fix) is a role-term miss, not a seniority
+// miss — those were previously both mislabeled 'skipped_seniority', which
+// corrupted the audit trail (2026-07-26 scan: 67+ mislabeled rows).
+function gateStatusFor(gate) {
+  if (gate.negative) return 'skipped_negative';
+  if (!gate.roleTerm) return 'skipped_role';
+  return 'skipped_seniority';
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const dryRun = args.includes('--dry-run');
@@ -1841,7 +1855,7 @@ async function main() {
           totalFilteredGate++;
           gateSkippedOffers.push({
             job: { ...job, source: sourceName },
-            status: gate.negative ? 'skipped_negative' : 'skipped_seniority',
+            status: gateStatusFor(gate),
           });
           continue;
         }

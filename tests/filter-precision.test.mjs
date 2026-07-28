@@ -137,3 +137,61 @@ test('Deputy CISO is unaffected by the associate/intern fixes', () => {
   assert.equal(result.admit, true);
   assert.equal(result.archetype, 'security-leadership');
 });
+
+// 2026-07-27 gate-followup: 'solutions architect' added to ROLE_TERMS so this
+// user's named target archetype (AI Solutions Architect, see
+// modes/_profile.md) stops being rejected by omission. 'solutions engineer'
+// deliberately stays out of ROLE_TERMS (sales-engineering title, out of
+// scope) — the ruling that kept it off NEGATIVE_TERMS did not put it on the
+// accept list either.
+test('Solutions Architect admits when senior, rejects when not, engineer stays out', () => {
+  const senior = classifyTitle('Sr. Solutions Architect, AWS Enterprise Industries');
+  assert.equal(senior.admit, true, 'Sr. Solutions Architect should admit');
+  assert.equal(senior.archetype, 'pm-family');
+
+  const specialist = classifyTitle('Worldwide Specialist Solutions Architect - Agentic Development, Data & AI GTM');
+  assert.equal(specialist.admit, false, '"Specialist" is not a seniority term');
+
+  const principal = classifyTitle('Principal Solutions Architect, Security');
+  assert.equal(principal.admit, true, 'Principal Solutions Architect should admit');
+  assert.equal(principal.archetype, 'pm-family');
+
+  const associate = classifyTitle('Associate Solutions Architect');
+  assert.equal(associate.admit, false, 'Associate Solutions Architect should still reject (negative)');
+  assert.equal(associate.negative, 'associate');
+
+  const engineer = classifyTitle('Solutions Engineer');
+  assert.equal(engineer.admit, false, 'Solutions Engineer stays out of scope — no role term');
+  assert.equal(engineer.roleTerm, null);
+});
+
+// 2026-07-27 gate-followup Fix 1: status selection must distinguish "no role
+// term at all" (skipped_role) from "role term present, no seniority"
+// (skipped_seniority). Both were previously collapsed into
+// 'skipped_seniority' by scan.mjs, mislabeling the audit trail. This
+// mirrors scan.mjs's gateStatusFor() logic directly against classifyTitle's
+// return shape so the status-selection contract has direct test coverage.
+function gateStatusFor(gate) {
+  if (gate.negative) return 'skipped_negative';
+  if (!gate.roleTerm) return 'skipped_role';
+  return 'skipped_seniority';
+}
+
+test('status selection distinguishes skipped_role vs skipped_seniority vs skipped_negative', () => {
+  const noRoleTerm = classifyTitle('Principal AI Security Specialist');
+  assert.equal(noRoleTerm.admit, false);
+  assert.equal(gateStatusFor(noRoleTerm), 'skipped_role');
+
+  const bareNoRole = classifyTitle('Sr. Data Platform Lead');
+  assert.equal(bareNoRole.roleTerm, null);
+  assert.equal(gateStatusFor(bareNoRole), 'skipped_role');
+
+  const roleNoSeniority = classifyTitle('Product Manager SSD');
+  assert.equal(roleNoSeniority.admit, false);
+  assert.equal(roleNoSeniority.roleTerm, 'product manager');
+  assert.equal(roleNoSeniority.seniorityTerm, null);
+  assert.equal(gateStatusFor(roleNoSeniority), 'skipped_seniority');
+
+  const negative = classifyTitle('Junior Product Manager');
+  assert.equal(gateStatusFor(negative), 'skipped_negative');
+});
