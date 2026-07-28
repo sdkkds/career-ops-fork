@@ -144,16 +144,22 @@ test('Deputy CISO is unaffected by the associate/intern fixes', () => {
 // deliberately stays out of ROLE_TERMS (sales-engineering title, out of
 // scope) — the ruling that kept it off NEGATIVE_TERMS did not put it on the
 // accept list either.
+//
+// 2026-07-28 tightening (superseded the un-qualified version of this test):
+// the bare 'solutions architect' role term alone turned out too broad in
+// live scan data (33 of 41 newly-admitted postings were AWS vendor
+// pre-sales), so a solutions-architect title now additionally requires a
+// security or AI/ML qualifier — see 'Solutions Architect admits only with an
+// AI/ML or security qualifier' below for the full qualifier matrix. The
+// "Specialist"/"Associate"/"Solutions Engineer" cases here are unaffected by
+// that tightening (they reject for other reasons) and stay as regression
+// coverage.
 test('Solutions Architect admits when senior, rejects when not, engineer stays out', () => {
-  const senior = classifyTitle('Sr. Solutions Architect, AWS Enterprise Industries');
-  assert.equal(senior.admit, true, 'Sr. Solutions Architect should admit');
-  assert.equal(senior.archetype, 'pm-family');
-
   const specialist = classifyTitle('Worldwide Specialist Solutions Architect - Agentic Development, Data & AI GTM');
   assert.equal(specialist.admit, false, '"Specialist" is not a seniority term');
 
   const principal = classifyTitle('Principal Solutions Architect, Security');
-  assert.equal(principal.admit, true, 'Principal Solutions Architect should admit');
+  assert.equal(principal.admit, true, 'Principal Solutions Architect should admit (security qualifier)');
   assert.equal(principal.archetype, 'pm-family');
 
   const associate = classifyTitle('Associate Solutions Architect');
@@ -163,6 +169,75 @@ test('Solutions Architect admits when senior, rejects when not, engineer stays o
   const engineer = classifyTitle('Solutions Engineer');
   assert.equal(engineer.admit, false, 'Solutions Engineer stays out of scope — no role term');
   assert.equal(engineer.roleTerm, null);
+});
+
+// 2026-07-28 tightening: live scan data showed the bare 'solutions
+// architect' role term admitting a standing inflow of AWS/Amazon vendor
+// cloud pre-sales titles (33 of 41 newly-admitted postings in one scan),
+// which does not match this user's named archetype (AI Solutions
+// Architect). Approved rule: 'solutions architect'/'solution architect'
+// only counts as a role term when the title also carries a security or
+// AI/ML qualifier. This is deliberately narrower than the general
+// "security is a signal, never a gate" rule (see lib/filter.mjs module
+// comment) — that rule protects PM-family titles, which don't need the
+// narrowing because the role term itself already disambiguates the
+// archetype; 'solutions architect' does not.
+test('Solutions Architect admits only with an AI/ML or security qualifier', () => {
+  const admitCases = [
+    'Principal Solutions Architect, Security',
+    'Senior Solutions Architect, AI Solutions',
+    'Sr Solutions Architect, Annapurna ML',
+    'Senior AI/ML Solutions Architect',
+  ];
+  for (const t of admitCases) {
+    const result = classifyTitle(t);
+    assert.equal(result.admit, true, `expected admit: ${t}`);
+    assert.equal(result.archetype, 'pm-family', `expected pm-family archetype: ${t}`);
+  }
+
+  const rejectCases = [
+    'Senior Solutions Architect, Enterprise (Retail, Restaurant & CPG)',
+    'Sr. Solutions Architect, AWS Aerospace & Satellite',
+    'Senior Partner Solutions Architect - GSI',
+    'Sr. TAM, Solutions Architect',
+  ];
+  for (const t of rejectCases) {
+    const result = classifyTitle(t);
+    assert.equal(result.admit, false, `expected reject (no AI/ML/security qualifier): ${t}`);
+    assert.equal(result.roleTerm, null, `expected roleTerm nulled by the qualifier gate: ${t}`);
+  }
+
+  // The substring trap: 'ai' must NOT match inside "Email" — bare AI/ML
+  // abbreviations are word-boundary matched (AMBIGUOUS_SHORT), same as
+  // 'pm'/'ciso'/'cso'.
+  const emailTrap = classifyTitle('Senior Solutions Architect, Email Infrastructure');
+  assert.equal(emailTrap.admit, false, '"ai" inside "Email" must not count as an AI/ML qualifier');
+  assert.equal(emailTrap.roleTerm, null);
+
+  // Associate Solutions Architect: still rejects, but on the negative gate
+  // (unaffected by the qualifier tightening — negative takes precedence).
+  const associate = classifyTitle('Associate Solutions Architect');
+  assert.equal(associate.admit, false);
+  assert.equal(associate.negative, 'associate');
+
+  // No seniority AND no AI/ML/security qualifier: the qualifier gate wins
+  // (roleTerm nulled), so the rejection reason is "no role term", not "no
+  // seniority" — status selection (gateStatusFor in scan.mjs) reports
+  // skipped_role here, not skipped_seniority.
+  const noQualifierNoSeniority = classifyTitle('Worldwide Specialist Solutions Architect - Agentic Development');
+  assert.equal(noQualifierNoSeniority.admit, false);
+  assert.equal(noQualifierNoSeniority.roleTerm, null, 'qualifier gate nulls roleTerm even though seniority is also missing');
+});
+
+// Unaffected by the Solutions Architect qualifier tightening — other role
+// terms and the security-leadership branch don't go through
+// SOLUTIONS_ARCHITECT_TERMS at all.
+test('the Solutions Architect qualifier tightening does not affect other role terms', () => {
+  assert.equal(classifyTitle('Senior Product Manager').admit, true);
+  assert.equal(classifyTitle('Field CISO').admit, true);
+  const tpm = classifyTitle('Senior Technical Program Manager, Security');
+  assert.equal(tpm.admit, true);
+  assert.equal(tpm.archetype, 'pm-family');
 });
 
 // 2026-07-27 gate-followup Fix 1: status selection must distinguish "no role
@@ -194,4 +269,10 @@ test('status selection distinguishes skipped_role vs skipped_seniority vs skippe
 
   const negative = classifyTitle('Junior Product Manager');
   assert.equal(gateStatusFor(negative), 'skipped_negative');
+
+  // Solutions Architect qualifier gate (2026-07-28): when the qualifier is
+  // missing, the reason is "no role term" even if seniority is ALSO
+  // missing — the qualifier gate wins over the seniority miss.
+  const unqualifiedNoSeniority = classifyTitle('Worldwide Specialist Solutions Architect - Agentic Development');
+  assert.equal(gateStatusFor(unqualifiedNoSeniority), 'skipped_role');
 });
