@@ -51,6 +51,13 @@
                           money or hitting live job boards.
     CAREEROPS_VAULT_DIR   Redirects vault output (decisions.jsonl,
                           morning-review.md) so tests do not pollute the vault.
+    CAREEROPS_DATA_DIR    Redirects pipeline.md, applications.md (via
+                          CAREER_OPS_TRACKER, propagated to merge-tracker.mjs /
+                          verify-pipeline.mjs / reserve-report-num.mjs) and
+                          needs-attention.md, so tests do not touch the user's
+                          real ~176-row queue / 11-row tracker. Defaults to
+                          $ProjectDir\data — byte-identical to the pre-override
+                          paths when unset.
     CAREEROPS_ALLOW_SCAN  Required to be '1' before scan will run. See the SCAN
                           SAFETY GATE block below. This one is a safety
                           interlock, not a test hook.
@@ -75,6 +82,12 @@ $PSNativeCommandUseErrorActionPreference = $false
 $ProjectDir    = "D:\sunja\projects\consulting\career-ops"
 $VaultDir      = if ($env:CAREEROPS_VAULT_DIR) { $env:CAREEROPS_VAULT_DIR }
                  else { "D:\sunja\projects\personal\Fortress of Solitude\career-ops" }
+# Redirects every live-data path this script touches (pipeline.md,
+# applications.md, needs-attention.md). Defaults to the project's real data
+# dir — must stay byte-identical to the pre-override paths when unset, since
+# this is the user's live pipeline.
+$DataDir       = if ($env:CAREEROPS_DATA_DIR) { $env:CAREEROPS_DATA_DIR }
+                 else { "$ProjectDir\data" }
 $Date          = (Get-Date).ToString("yyyy-MM-dd")
 $RunTimestamp  = (Get-Date).ToString("yyyy-MM-dd HH:mm")
 # needs-attention.md is written by three producers (this script, digest.mjs and
@@ -88,8 +101,9 @@ $LogDir        = "$ProjectDir\batch\logs"
 $ReportsDir    = "$ProjectDir\reports"
 $TsvDir        = "$ProjectDir\batch\tracker-additions"
 $BatchPrompt   = "$ProjectDir\batch\batch-prompt.md"
-$PipelineFile  = "$ProjectDir\data\pipeline.md"
-$NeedsAttnFile = "$ProjectDir\data\needs-attention.md"
+$PipelineFile  = "$DataDir\pipeline.md"
+$NeedsAttnFile = "$DataDir\needs-attention.md"
+$TrackerFile   = "$DataDir\applications.md"
 $ScanSysFile   = "$ProjectDir\modes\scan.md"
 $MorningReview = "$VaultDir\morning-review.md"
 $DecisionsLog  = "$VaultDir\decisions.jsonl"
@@ -104,6 +118,25 @@ $WorkerCmd     = if ($env:CAREEROPS_WORKER_CMD) { $env:CAREEROPS_WORKER_CMD } el
 # Setup
 New-Item -ItemType Directory -Force -Path $VaultDir | Out-Null
 New-Item -ItemType Directory -Force -Path $LogDir   | Out-Null
+New-Item -ItemType Directory -Force -Path $DataDir  | Out-Null
+
+# Every node helper this script shells out to (reserve-report-num.mjs,
+# merge-tracker.mjs, verify-pipeline.mjs) resolves the tracker path itself
+# via resolveTrackerPath()/CAREER_OPS_TRACKER rather than taking it as a CLI
+# arg. Setting it here for this process's environment propagates $DataDir to
+# every child `node` invocation below, so a redirected data dir reaches them
+# too — otherwise a test pointing CAREEROPS_DATA_DIR at a temp dir would still
+# merge into and verify the user's real data/applications.md. When
+# CAREEROPS_DATA_DIR is unset this resolves to the same
+# data\applications.md path those scripts would have picked by default, so
+# real runs are unaffected.
+$env:CAREER_OPS_TRACKER = $TrackerFile
+# Report files themselves are never redirected by CAREEROPS_DATA_DIR (they stay
+# under $ProjectDir\reports even during isolated test runs) — only merge-tracker.mjs's
+# link math needs telling, so a redirected tracker still computes report links
+# that resolve against the real reports/ dir instead of 404ing relative to a
+# temp data dir. See CAREER_OPS_REPORTS_ROOT in merge-tracker.mjs.
+$env:CAREER_OPS_REPORTS_ROOT = $ProjectDir
 
 function Write-Log {
     param([string]$Msg, [string]$Color = 'White')

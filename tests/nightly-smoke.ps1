@@ -6,8 +6,8 @@
   Two scenarios, both of which actually EXECUTE the orchestrator rather than
   just parsing it:
 
-    1. Dry run against the live pipeline. Proves the script parses, the node
-       helpers are reachable, and the reconciliation gate runs.
+    1. Dry run against the isolated pipeline. Proves the script parses, the
+       node helpers are reachable, and the reconciliation gate runs.
 
     2. Forced failure. Puts one URL in the pipeline and points the orchestrator
        at a stub worker that prints prose and exits 0 — the exact shape of the
@@ -19,7 +19,13 @@
   scenarios pass -EvalOnly). It does not touch the scheduled task.
 
   Isolation: vault writes are redirected to a temp dir via CAREEROPS_VAULT_DIR,
-  and data/pipeline.md + data/needs-attention.md are backed up and restored.
+  and pipeline.md / applications.md / needs-attention.md are redirected to a
+  per-run temp data dir via CAREEROPS_DATA_DIR (run-nightly.ps1 propagates that
+  to merge-tracker.mjs / verify-pipeline.mjs / reserve-report-num.mjs via
+  CAREER_OPS_TRACKER, so nothing in this suite reads or writes the user's real
+  ~176-row queue or 11-row tracker). The real data/pipeline.md,
+  data/applications.md and data/needs-attention.md are additionally backed up
+  and restored as defence in depth, even though nothing should touch them now.
 #>
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
@@ -40,20 +46,52 @@ $null = [System.Management.Automation.Language.Parser]::ParseFile(
 if ($parseErrors) { throw "run-nightly.ps1 has parse errors: $($parseErrors | Out-String)" }
 Write-Host "    ok" -ForegroundColor DarkGray
 
+# --- Scratch state so neither scenario pollutes the vault or the user's real
+#     data dir. Built BEFORE any node helper call below so isolation is in
+#     effect for the whole suite, not just the run-nightly.ps1 invocations.
+#
+#     Deliberately NOT under the OS temp dir ([IO.Path]::GetTempPath(), i.e.
+#     %TEMP%): on this box %TEMP% is on C: while the repo is on D:, and
+#     merge-tracker.mjs's report-link math uses path.relative(trackerDir,
+#     reportsDir) — Node's path.relative() cannot compute a relative path
+#     across two different Windows drive letters and silently falls back to
+#     returning the absolute target path instead, which then fails
+#     verify-pipeline's report-link existence check. Keeping the scratch dir
+#     on the repo's own drive sidesteps that entirely and matches how the
+#     real data dir is always co-located with the repo in production. ---
+$Scratch      = Join-Path $Root ".smoke-tmp\careerops-smoke-$PID"
+$VaultStub    = Join-Path $Scratch 'vault'
+$DataStub     = Join-Path $Scratch 'data'
+$StubWorker   = Join-Path $Scratch 'stub-worker.ps1'
+New-Item -ItemType Directory -Force -Path $VaultStub | Out-Null
+New-Item -ItemType Directory -Force -Path $DataStub  | Out-Null
+
+# Isolated pipeline/tracker/needs-attention live under $DataStub for the whole
+# run. run-nightly.ps1 reads CAREEROPS_DATA_DIR and propagates it (via
+# CAREER_OPS_TRACKER) to merge-tracker.mjs / verify-pipeline.mjs /
+# reserve-report-num.mjs, so every one of those child processes also targets
+# this temp dir instead of the user's real data/applications.md.
+$PipelineFile = Join-Path $DataStub 'pipeline.md'
+$Tracker      = Join-Path $DataStub 'applications.md'
+$NeedsAttn    = Join-Path $DataStub 'needs-attention.md'
+
+# Section headers ('## Pendientes' / '## Procesadas') are load-bearing —
+# reconcile-pipeline.mjs and scan.mjs key off them by name — so the seed must
+# use the same structure as the real file, not an ad hoc placeholder.
+"# Pipeline - Pending Evaluations`n`n## Pendientes`n`n## Procesadas`n" |
+    Set-Content $PipelineFile -Encoding utf8 -NoNewline
+
+# Matches the real data/applications.md header exactly (11 columns) so
+# merge-tracker.mjs's row parser sees the same shape it does in production.
+"# Applications Tracker`n`n| # | Date | Company | Via | Role | Score | Status | PDF | Report | URL | Notes |`n|---|------|---------|-----|------|-------|--------|-----|--------|-----|-------|`n" |
+    Set-Content $Tracker -Encoding utf8 -NoNewline
+
 Write-Host "2. Node helpers reachable" -ForegroundColor Cyan
-node lib/pipeline-state.mjs --file data\pipeline.md --list --limit 1 | Out-Null
+node lib/pipeline-state.mjs --file "$PipelineFile" --list --limit 1 | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "pipeline-state CLI failed" }
 node lib/eval-verify.mjs --log nul --root $Root --report x.md --tsv x.tsv --url https://x.test | Out-Null
 if ($LASTEXITCODE -ne 1) { throw "eval-verify should exit 1 on an empty log, got $LASTEXITCODE" }
 Write-Host "    ok" -ForegroundColor DarkGray
-
-# --- Scratch state so neither scenario pollutes the vault or live data ---
-$Scratch      = Join-Path ([IO.Path]::GetTempPath()) "careerops-smoke-$PID"
-$VaultStub    = Join-Path $Scratch 'vault'
-$StubWorker   = Join-Path $Scratch 'stub-worker.ps1'
-$PipelineFile = "$Root\data\pipeline.md"
-$NeedsAttn    = "$Root\data\needs-attention.md"
-New-Item -ItemType Directory -Force -Path $VaultStub | Out-Null
 
 # Stub A ignores every flag the orchestrator passes, prints prose, exits 0.
 # This is the exact shape of the old bug: exit 0 plus some braces in stdout used
@@ -140,15 +178,21 @@ console.error("digest stub: simulated send failure");
 process.exit(1);
 '@ | Set-Content $DigestFailStub -Encoding utf8
 
-$Tracker        = "$Root\data\applications.md"
-$InflightFile   = "$Root\batch\.nightly-inflight.json"
-$pipelineBackup = Get-Content $PipelineFile -Raw -Encoding utf8
-$trackerBackup  = Get-Content $Tracker -Raw -Encoding utf8
-$needsBackup    = if (Test-Path $NeedsAttn) { Get-Content $NeedsAttn -Raw -Encoding utf8 } else { $null }
+# Real live files, kept ONLY for the defence-in-depth backup/restore below.
+# Nothing in this suite should read or write these once CAREEROPS_DATA_DIR is
+# set — they are the user's real ~176-row queue and 11-row tracker.
+$RealPipelineFile = "$Root\data\pipeline.md"
+$RealTracker      = "$Root\data\applications.md"
+$RealNeedsAttn    = "$Root\data\needs-attention.md"
+$InflightFile     = "$Root\batch\.nightly-inflight.json"
+$pipelineBackup   = Get-Content $RealPipelineFile -Raw -Encoding utf8
+$trackerBackup    = Get-Content $RealTracker -Raw -Encoding utf8
+$needsBackup      = if (Test-Path $RealNeedsAttn) { Get-Content $RealNeedsAttn -Raw -Encoding utf8 } else { $null }
 
 try {
     Write-Host "3. Dry run, eval only" -ForegroundColor Cyan
     $env:CAREEROPS_VAULT_DIR = $VaultStub
+    $env:CAREEROPS_DATA_DIR  = $DataStub
     pwsh -NoProfile -File "$Root\run-nightly.ps1" -EvalOnly -MaxJobs 1 -DryRun | Out-Null
     Assert-True ($LASTEXITCODE -eq 0) "dry run exited 0 (got $LASTEXITCODE)"
     Assert-True (-not (Test-Path (Join-Path $VaultStub 'morning-review.md'))) "dry run wrote no morning-review"
@@ -208,7 +252,7 @@ try {
     Assert-True ($row2 -match '<!-- attempts:2 -->') "attempts advanced 1 -> 2, budget is not stuck"
 
     Write-Host "6. Retry budget exhausted: the row is no longer actionable" -ForegroundColor Cyan
-    $listed = node lib/pipeline-state.mjs --file data\pipeline.md --list --limit 10 | Out-String
+    $listed = node lib/pipeline-state.mjs --file "$PipelineFile" --list --limit 10 | Out-String
     Assert-True ($listed -notmatch [regex]::Escape($url)) "row past the retry budget is not listed again"
 
     pwsh -NoProfile -File "$Root\run-nightly.ps1" -EvalOnly -MaxJobs 1 | Out-Null
@@ -268,7 +312,7 @@ try {
     $crashUrl = 'https://x.test/j/smoke-crash'
     Add-Content $PipelineFile "- [ ] $crashUrl | StubCo | Senior Security PM" -Encoding utf8
     # Simulate a run that died between the two marker writes.
-    node lib/pipeline-state.mjs --file data\pipeline.md --url $crashUrl --state in-progress | Out-Null
+    node lib/pipeline-state.mjs --file "$PipelineFile" --url $crashUrl --state in-progress | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "could not stage the in-progress row" }
 
     $env:CAREEROPS_WORKER_CMD = $GoodWorker
@@ -327,7 +371,7 @@ try {
     # URL to a second PAID worker and let two runs fight over the marker.
     $ownedUrl = 'https://x.test/j/owned-by-live'
     Add-Content $PipelineFile "- [ ] $ownedUrl | StubCo | Senior Security PM" -Encoding utf8
-    node lib/pipeline-state.mjs --file data\pipeline.md --url $ownedUrl --state in-progress | Out-Null
+    node lib/pipeline-state.mjs --file "$PipelineFile" --url $ownedUrl --state in-progress | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "could not stage the owned in-progress row" }
     # $PID here is this test process, which stays alive for the whole child run.
     @{ $ownedUrl = @{ pid = $PID; started = 'smoke' } } | ConvertTo-Json -Depth 5 |
@@ -420,9 +464,10 @@ try {
     Write-Host "15. needs-attention timestamps are a single format" -ForegroundColor Cyan
     # run-nightly.ps1, digest.mjs and merge-tracker.mjs all append to this table.
     # Two of the three used toISOString(); the orchestrator used
-    # 'yyyy-MM-dd HH:mm', so the same table interleaved two formats.
-    # Only rows THIS run wrote: data/needs-attention.md is live append-only data
-    # and may already hold rows in the old format from before this fix.
+    # 'yyyy-MM-dd HH:mm', so the same table interleaved two formats. This
+    # needs-attention.md is a fresh temp file created only by this run, so
+    # every row in it (not just the ones matching these patterns) originates
+    # from this suite — the filter below is just belt-and-suspenders.
     $naRows = @(Get-Content $NeedsAttn -Encoding utf8 |
         Where-Object { $_ -match '^\| ' -and ($_ -match 'x\.test' -or $_ -match [regex]::Escape($badRowUrl)) })
     Assert-True ($naRows.Count -gt 0) "there are needs-attention rows to check (got $($naRows.Count))"
@@ -432,16 +477,19 @@ try {
 finally {
     Remove-Item Env:\CAREEROPS_WORKER_CMD          -ErrorAction SilentlyContinue
     Remove-Item Env:\CAREEROPS_VAULT_DIR           -ErrorAction SilentlyContinue
+    Remove-Item Env:\CAREEROPS_DATA_DIR            -ErrorAction SilentlyContinue
     Remove-Item Env:\CAREEROPS_SMOKE_ROOT          -ErrorAction SilentlyContinue
     Remove-Item Env:\CAREEROPS_SMOKE_SCRATCH       -ErrorAction SilentlyContinue
     Remove-Item Env:\CAREEROPS_DIGEST_CMD          -ErrorAction SilentlyContinue
     Remove-Item Env:\CAREEROPS_DIGEST_PREFIX_ARGS  -ErrorAction SilentlyContinue
     if (Test-Path $PipelineFile) { Set-ItemProperty -Path $PipelineFile -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue }
     Remove-Item $InflightFile -Force -ErrorAction SilentlyContinue
-    Set-Content $PipelineFile -Value $pipelineBackup -NoNewline -Encoding utf8
-    Set-Content $Tracker      -Value $trackerBackup  -NoNewline -Encoding utf8
-    if ($null -ne $needsBackup) { Set-Content $NeedsAttn -Value $needsBackup -NoNewline -Encoding utf8 }
-    else { Remove-Item $NeedsAttn -Force -ErrorAction SilentlyContinue }
+    # Defence in depth: restore the real files even though isolation via
+    # CAREEROPS_DATA_DIR should mean nothing touched them this run.
+    Set-Content $RealPipelineFile -Value $pipelineBackup -NoNewline -Encoding utf8
+    Set-Content $RealTracker      -Value $trackerBackup  -NoNewline -Encoding utf8
+    if ($null -ne $needsBackup) { Set-Content $RealNeedsAttn -Value $needsBackup -NoNewline -Encoding utf8 }
+    else { Remove-Item $RealNeedsAttn -Force -ErrorAction SilentlyContinue }
     # Sweep by pattern rather than by a snapshot taken mid-run: later scenarios
     # create artifacts too, and a snapshot only catches the ones that existed
     # when it was taken.

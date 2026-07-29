@@ -77,7 +77,14 @@ const TRACKER_LOCK_DIR = trackerLockDirFor(APPS_FILE);
 
 // The reports/ dir sits at the repo root, which is the tracker's parent in the
 // data/ layout (data/applications.md) and the tracker's own dir at root layout.
-const REPORTS_ROOT = basename(TRACKER_DIR) === 'data' ? dirname(TRACKER_DIR) : TRACKER_DIR;
+// CAREER_OPS_REPORTS_ROOT overrides this explicitly (used by run-nightly.ps1
+// when CAREEROPS_DATA_DIR redirects the tracker somewhere that is not a
+// sibling of the real reports/ dir, e.g. a test's temp data dir — report
+// files themselves are never redirected, so the link math must still resolve
+// against the real repo root or every generated report link 404s).
+const REPORTS_ROOT = process.env.CAREER_OPS_REPORTS_ROOT
+  ? resolve(process.env.CAREER_OPS_REPORTS_ROOT)
+  : (basename(TRACKER_DIR) === 'data' ? dirname(TRACKER_DIR) : TRACKER_DIR);
 
 /**
  * Normalize report links before writing them into the tracker file.
