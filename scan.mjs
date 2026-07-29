@@ -44,7 +44,7 @@ import { classifyFetchError } from './verify-portals.mjs';
 import { fingerprintText, findCrossListings } from './fingerprint-core.mjs';
 import { resolveColumns, parseTrackerRow } from './tracker-parse.mjs';
 import { normalizeCompany } from './tracker-utils.mjs';
-import { classifyTitle } from './lib/filter.mjs';
+import { classifyTitle, classifyLocation } from './lib/filter.mjs';
 
 try {
   const { config } = await import('dotenv');
@@ -1770,6 +1770,8 @@ async function main() {
   let totalFilteredTitle = 0;
   let totalFilteredGate = 0;
   const gateSkippedOffers = [];
+  let totalFilteredLocationGate = 0;
+  const locationGateSkippedOffers = [];
   let totalFilteredTier = 0;
   let totalFilteredLocation = 0;
   let totalFilteredPostingAge = 0;
@@ -1856,6 +1858,25 @@ async function main() {
           gateSkippedOffers.push({
             job: { ...job, source: sourceName },
             status: gateStatusFor(gate),
+          });
+          continue;
+        }
+        // Location pre-screen gate — a comp/location string check that runs
+        // BEFORE any paid LLM evaluation. Owner lives in Seattle and wants
+        // remote roles; non-US region-scoped postings (even ones that say
+        // "remote") are dropped here for free instead of costing a full
+        // evaluation to discover. See lib/filter.mjs classifyLocation for the
+        // full rule. Distinct from the generic locationFilter (always_allow/
+        // allow/block) below — that one is opt-in config, this one carries
+        // its own sensible defaults and is always on. Rejections are recorded
+        // to scan-history (status skipped_location) exactly like the title
+        // gate above, so they're auditable and deduped on rescan.
+        const locationGate = classifyLocation(job.location, config.location_filter);
+        if (!locationGate.admit) {
+          totalFilteredLocationGate++;
+          locationGateSkippedOffers.push({
+            job: { ...job, source: sourceName },
+            status: 'skipped_location',
           });
           continue;
         }
@@ -2020,6 +2041,12 @@ async function main() {
       appendToScanHistory(group, date, status);
     }
   }
+  // Location pre-screen gate rejections — same auditable-and-deduped
+  // treatment as the role/seniority gate above, under the skipped_location
+  // status.
+  if (!dryRun && locationGateSkippedOffers.length > 0) {
+    appendToScanHistory(locationGateSkippedOffers.map(({ job }) => job), date, 'skipped_location');
+  }
 
   // 7. Print summary
   console.log(`\n${'━'.repeat(45)}`);
@@ -2032,6 +2059,7 @@ async function main() {
   console.log(`Total jobs found:      ${totalFound}`);
   console.log(`Filtered by title:     ${totalFilteredTitle} removed`);
   console.log(`Filtered by role/seniority gate: ${totalFilteredGate} removed`);
+  console.log(`Filtered by location gate: ${totalFilteredLocationGate} removed`);
   if (skipTiers.length > 0) {
     console.log(`Filtered by tier:      ${totalFilteredTier} removed`);
   }
