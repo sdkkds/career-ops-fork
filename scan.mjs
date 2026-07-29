@@ -135,6 +135,82 @@ export function matchedTitleKeywords(title, titleFilter) {
     .map(({ raw: kw }) => kw);
 }
 
+// ── Company blocklist (corporate-HQ policy) ─────────────────────────
+// Optional. If `company_blocklist` is absent/empty from portals.yml, nothing
+// is blocked — fail open, never fail closed.
+//
+// This is a COMPANY-LEVEL policy gate, distinct from the location gate above
+// (a Tel Aviv posting is already rejected by location; this catches an
+// Israel-HQ'd company posting a US-remote role, which location alone would
+// admit). Also distinct from the pre-existing data/blacklist.md do-not-apply
+// list (#1742) — that's the user's own free-form list checked against a
+// live data file; this is a specific, sourced policy list checked against
+// portals.yml, with its own scan-history status (skipped_company).
+//
+// Seeded criterion (deliberately narrow): a company's GLOBAL CORPORATE HQ is
+// in Israel. NOT "Israeli-founded" and NOT "has Israeli R&D" — Orca
+// Security, Axonius, Wiz, and SentinelOne are all Israeli-founded with
+// primary R&D in Tel Aviv, but all four are US-headquartered (Portland, New
+// York, New York, Mountain View), so none of them qualifies. Every entry in
+// `company_blocklist` must be verified against a primary source (SEC filing,
+// company "About"/legal page) confirming REGISTERED/PRINCIPAL global HQ, not
+// founding story or engineering-office location. Do not add a company here
+// from memory or inference.
+//
+// Matching: case-insensitive, tolerant of common corporate-suffix variants
+// (Ltd., Inc., Technologies, Software, Systems, ...) so "Check Point",
+// "Check Point Software", "Check Point Software Technologies Ltd.", and
+// "CheckPoint" all match one entry — but matching is EXACT after
+// suffix-stripping/normalization, not a substring/`.includes()` check, so an
+// unrelated company whose name happens to contain a blocklisted one as a
+// substring (e.g. a hypothetical "Check Point Capital Partners") is not
+// swept in. The known residual risk is the mirror case: a genuinely
+// different company whose name normalizes to the exact same token sequence
+// (e.g. "Checkpoint Systems", an unrelated RFID/security-tag company) would
+// also match. Given the seed list is short and curated, this is an accepted
+// tradeoff over a stricter (and much fussier) matcher; revisit only if it
+// causes a real miss.
+
+// Corporate-entity suffix words stripped from the END of a normalized name
+// before comparison — order-independent (all are just removed if trailing).
+const COMPANY_SUFFIX_WORDS = new Set([
+  'ltd', 'limited', 'inc', 'incorporated', 'corp', 'corporation', 'co',
+  'company', 'plc', 'llc', 'gmbh', 'technologies', 'technology', 'software',
+  'group', 'holdings', 'systems', 'solutions', 'sa', 'ag', 'nv', 'bv', 'pte',
+  'pty',
+]);
+
+function normalizeCompanyForBlocklist(name) {
+  const cleaned = String(name ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return '';
+  const words = cleaned.split(' ');
+  while (words.length > 1 && COMPANY_SUFFIX_WORDS.has(words[words.length - 1])) {
+    words.pop();
+  }
+  return words.join(''); // space-insensitive: "Check Point" and "CheckPoint" normalize identically
+}
+
+export function buildCompanyBlocklist(companyBlocklist) {
+  const list = Array.isArray(companyBlocklist)
+    ? companyBlocklist
+    : (typeof companyBlocklist === 'string' ? [companyBlocklist] : []);
+  const normalized = new Set(
+    list
+      .filter(k => typeof k === 'string' && k.trim())
+      .map(normalizeCompanyForBlocklist)
+      .filter(Boolean),
+  );
+  if (normalized.size === 0) return () => false;
+  return (companyName) => {
+    if (typeof companyName !== 'string' || !companyName.trim()) return false;
+    return normalized.has(normalizeCompanyForBlocklist(companyName));
+  };
+}
+
 // ── Location filter ─────────────────────────────────────────────────
 // Optional. If `location_filter` is absent from portals.yml, all locations pass.
 // Semantics (case-insensitive substring, in this order):
@@ -1682,6 +1758,7 @@ async function main() {
     classifyTier = mod.classifyTier || mod.default;
   }
 
+  const companyBlocklist = buildCompanyBlocklist(config.company_blocklist);
   const locationFilter = buildLocationFilter(config.location_filter);
   const postingAgeFilter = buildPostingAgeFilter(config.max_posting_age_days);
   const postedDateFilter = buildPostedDateFilter(postedAfter, postedBefore);
@@ -1768,6 +1845,8 @@ async function main() {
   const cooldownOffers = [];
   let totalFound = 0;
   let totalFilteredTitle = 0;
+  let totalFilteredCompanyGate = 0;
+  const companyGateSkippedOffers = [];
   let totalFilteredGate = 0;
   const gateSkippedOffers = [];
   let totalFilteredLocationGate = 0;
@@ -1820,6 +1899,24 @@ async function main() {
         job.trustScore = trustResult.score;
         job.trustFlags = trustResult.flags;
         job.trustLevel = trustResult.level;
+
+        // Corporate-HQ company blocklist — a sourced policy gate (e.g. "no
+        // Israel-HQ'd companies"), checked before every other gate: it's the
+        // cheapest check and the decision is unconditional (see
+        // buildCompanyBlocklist above for the matching rules and the
+        // HQ-only criterion). Distinct from the data/blacklist.md do-not-
+        // apply list below — that's the user's free-form list; this is a
+        // curated, sourced portals.yml list with its own scan-history
+        // status (skipped_company) so rejections are auditable and deduped
+        // on rescan, exactly like the title/location gates.
+        if (companyBlocklist(job.company)) {
+          totalFilteredCompanyGate++;
+          companyGateSkippedOffers.push({
+            job: { ...job, source: sourceName },
+            status: 'skipped_company',
+          });
+          continue;
+        }
 
         // Company blacklist (#1742) — the user's own do-not-apply decision,
         // checked first: it's company-level, not a per-posting signal. Never
@@ -2047,6 +2144,11 @@ async function main() {
   if (!dryRun && locationGateSkippedOffers.length > 0) {
     appendToScanHistory(locationGateSkippedOffers.map(({ job }) => job), date, 'skipped_location');
   }
+  // Corporate-HQ company blocklist rejections — same auditable-and-deduped
+  // treatment, under the skipped_company status.
+  if (!dryRun && companyGateSkippedOffers.length > 0) {
+    appendToScanHistory(companyGateSkippedOffers.map(({ job }) => job), date, 'skipped_company');
+  }
 
   // 7. Print summary
   console.log(`\n${'━'.repeat(45)}`);
@@ -2058,6 +2160,7 @@ async function main() {
   if (summaryBoards > 0) console.log(`Job boards scanned:    ${summaryBoards}`);
   console.log(`Total jobs found:      ${totalFound}`);
   console.log(`Filtered by title:     ${totalFilteredTitle} removed`);
+  console.log(`Filtered by company blocklist: ${totalFilteredCompanyGate} removed`);
   console.log(`Filtered by role/seniority gate: ${totalFilteredGate} removed`);
   console.log(`Filtered by location gate: ${totalFilteredLocationGate} removed`);
   if (skipTiers.length > 0) {
