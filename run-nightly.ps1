@@ -90,6 +90,10 @@ $DataDir       = if ($env:CAREEROPS_DATA_DIR) { $env:CAREEROPS_DATA_DIR }
                  else { "$ProjectDir\data" }
 $Date          = (Get-Date).ToString("yyyy-MM-dd")
 $RunTimestamp  = (Get-Date).ToString("yyyy-MM-dd HH:mm")
+# Real wall-clock start, for Write-Trace's elapsed column. Deliberately NOT
+# reusing $RunTimestamp: that one is minute-resolution and doubles as the
+# decisions.jsonl / digest-cursor comparison value, so it must not be re-derived.
+$ScriptStart   = Get-Date
 # needs-attention.md is written by three producers (this script, digest.mjs and
 # merge-tracker.mjs). The other two use JS `toISOString()`, so this one matches
 # them rather than interleaving a second format into the same table. Kept
@@ -143,6 +147,35 @@ function Write-Log {
     $line = "[$RunTimestamp] $Msg"
     Write-Host $line -ForegroundColor $Color
     $line | Out-File $RunLog -Encoding utf8 -Append
+}
+
+# Exit-path tracer (2026-07-30). Write-Log stamps every line with
+# $RunTimestamp -- fixed at run start -- so the run log cannot say WHEN a step
+# happened. That is fine for reading a night's outcome and useless for finding
+# where a run stopped: the 2026-07-29 hang produced a log whose every line read
+# 21:28, while the artifacts on disk showed the work finishing at 21:38 and the
+# process staying alive until 07:45.
+#
+# This writes wall-clock time, elapsed seconds, and the live descendant count to
+# a separate trace file. Descendants matter because the eval worker is
+# `claude --print`, which starts MCP servers of its own; a grandchild that
+# outlives the run while holding an inherited stdout handle is a known way for a
+# script to finish its work and still not exit. Appends and swallows its own
+# errors -- a tracer must never be the reason a run fails.
+$TraceLog = "$LogDir\nightly-trace-$Date.log"
+function Write-Trace {
+    param([string]$Stage)
+    try {
+        $descendants = -1
+        try {
+            $mine = (Get-CimInstance Win32_Process -Filter "ParentProcessId=$PID" -ErrorAction Stop)
+            $descendants = @($mine).Count
+        } catch { }
+        $elapsed = [math]::Round(((Get-Date) - $ScriptStart).TotalSeconds, 1)
+        "{0}  +{1,8}s  pid={2}  children={3}  {4}" -f `
+            (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $elapsed, $PID, $descendants, $Stage |
+            Out-File $TraceLog -Encoding utf8 -Append -ErrorAction Stop
+    } catch { }
 }
 
 # Set-StrictMode makes `$obj.missing` a terminating error. Worker-shaped JSON is
@@ -697,11 +730,14 @@ if ($tsvsNow -lt $completed) {
     exit 1
 }
 
+Write-Trace 'tail: before merge-tracker'
 & node merge-tracker.mjs
 if ($LASTEXITCODE -ne 0) { Write-Log "FATAL: merge-tracker failed." 'Red'; exit 1 }
+Write-Trace 'tail: merge-tracker returned'
 
 & node verify-pipeline.mjs
 $verifyExit = $LASTEXITCODE
+Write-Trace "tail: verify-pipeline returned exit=$verifyExit"
 if ($verifyExit -ne 0) {
     Write-Log "verify-pipeline reported errors — see data/needs-attention.md" 'Red'
     Add-NeedsAttention -Url '(pipeline)' -Stage 'verify-pipeline' -Reason "verify-pipeline exit=$verifyExit"
@@ -740,8 +776,10 @@ if ($verifyExit -ne 0) {
 # postings vs. clean night) even when digest failed, so that information is
 # not silently dropped for this run. $digestExit overrides the exit code at
 # the very end instead.
+Write-Trace 'tail: before digest.mjs'
 & node digest.mjs --file $DecisionsLog --needs-attention $NeedsAttnFile --cursor $DigestCursor --since $RunTimestamp
 $digestExit = $LASTEXITCODE
+Write-Trace "tail: digest.mjs returned exit=$digestExit"
 if ($digestExit -ne 0) {
     Write-Log "Digest send failed — see $NeedsAttnFile" 'Red'
 }
@@ -751,6 +789,7 @@ if ($digestExit -ne 0) {
 # as "this run is broken", and giving them the same exit code trains the owner
 # to ignore both. See the exit-code contract in the header.
 $unverified = $evaluated - $completed
+Write-Trace "tail: exit branching (evaluated=$evaluated completed=$completed digestExit=$digestExit)"
 if ($unverified -gt 0) {
     if ($completed -eq 0) {
         # Nothing at all worked. That is a broken run, not a stale-posting run.
@@ -772,9 +811,16 @@ if ($digestExit -ne 0) {
 }
 
 Write-Log "=== Done ===" 'Green'
+Write-Trace 'tail: about to exit 0'
 exit 0
 
 } finally {
+    # Traced individually: `exit` inside a try runs this block first, so a
+    # process that has logged "about to exit" and never dies is stuck HERE, and
+    # the child count says whether a surviving grandchild is holding it open.
+    Write-Trace 'finally: entered'
     Pop-Location
+    Write-Trace 'finally: Pop-Location done'
     Remove-Item $LockFile -Force -ErrorAction SilentlyContinue
+    Write-Trace 'finally: lock removed -- process should now exit'
 }
