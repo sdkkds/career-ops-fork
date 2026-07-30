@@ -376,15 +376,45 @@ if (process.argv[1] && basename(process.argv[1]) === 'digest.mjs') {
     process.exit(1);
   }
 
+  // Bounded send (2026-07-30). Defense-in-depth, NOT a fix for an observed
+  // hang -- being precise because the first draft of this comment blamed a
+  // stall on this call and the evidence refuted it. What happened: a 2026-07-29
+  // nightly run hung for 10 hours, and digest looked like the culprit until the
+  // cursor file showed otherwise. advanceCursor() runs only after execFileSync
+  // returns, and digest-cursor.json was written at 21:38:08 -- so the send had
+  // already succeeded and the process stalled somewhere after it. Root cause
+  // still open.
+  //
+  // The defect this DOES address is latent and real: an unbounded external
+  // send inside an unattended job. execFileSync with no timeout waits forever
+  // on a child that neither exits nor writes, and under a scheduled task there
+  // is no stdin to satisfy one that asks for input. gws reaches the network and
+  // a keyring, so it has several ways to stall that no amount of valid auth
+  // rules out.
+  //
+  // stdio:'pipe' so a stalled child's partial output is captured and reported
+  // instead of vanishing into an inherited console nobody is watching. The
+  // timeout turns a silent multi-hour stall into the ordinary send-failure path
+  // below: logged, written to needs-attention, cursor NOT advanced, exit 1 --
+  // which nightly-smoke.ps1 scenario 13 already covers.
+  const sendTimeoutMs = Number(process.env.CAREEROPS_DIGEST_TIMEOUT_MS) || 90_000;
   try {
     execFileSync(digestCmd, [
       ...prefixArgs,
       'gmail', '+send', '--to', recipient, '--subject', subject, '--body', body,
-    ], { stdio: 'inherit' });
+    ], { stdio: 'pipe', timeout: sendTimeoutMs, encoding: 'utf8' });
     console.log(`Sent ${items.length} result(s).`);
     advanceCursor();
   } catch (err) {
-    const reason = `digest send failed: ${err.message}`;
+    // A timeout kill surfaces as ETIMEDOUT/SIGTERM with no exit status. Say so
+    // explicitly -- "digest send failed: null" would otherwise read as a crash
+    // and send the next reader hunting in the wrong place.
+    const timedOut = err.code === 'ETIMEDOUT' || (err.killed && err.status === null);
+    const detail = timedOut
+      ? `no response in ${sendTimeoutMs}ms (killed)`
+      : err.message;
+    const stderr = (err.stderr || '').toString().trim();
+    const reason = `digest send failed: ${detail}${stderr ? ` -- stderr: ${stderr.slice(0, 500)}` : ''}`;
     console.error(reason);
     recordNeedsAttention(needsAttention, {
       url: '', stage: 'digest-send', reason, at: new Date().toISOString(),
