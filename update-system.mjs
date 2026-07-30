@@ -351,6 +351,7 @@ const USER_PATHS = [
   '.gitattributes',         // local: forces LF on *.sh so Git Bash can parse them
   '.mcp.json',              // per-project MCP server config
   'run-nightly.ps1',        // local PowerShell nightly orchestrator (no upstream counterpart)
+  'check-fork-invariants.mjs', // local: guards the batch-runner permission scoping across merges
   'cv-beta.md',             // CV revision history
   'cv-azure-gov-rewrite-proposed.md',
   'qa-fixtures/',           // frozen QA data corpus — an update must never overwrite it
