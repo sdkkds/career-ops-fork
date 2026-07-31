@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/santifer/career-ops/compare/web-v0.5.0...web-v0.5.1) (2026-07-31)
+
+
+### Bug Fixes
+
+* **dashboard:** localize the hired status label and buffer split stream openers ([#2295](https://github.com/santifer/career-ops/issues/2295)) ([8f5d10d](https://github.com/santifer/career-ops/commit/8f5d10d6aa97438a4ac3908814456df5a8cf4083))
+
 ## [0.5.0](https://github.com/santifer/career-ops/compare/web-v0.4.0...web-v0.5.0) (2026-07-30)
 
 
