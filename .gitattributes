@@ -1,2 +1,14 @@
 # Shell scripts must stay LF — Git Bash chokes on CRLF (syntax error near \$'{\r')
 *.sh text eol=lf
+
+# Lockfiles are generated, not authored. A three-way merge of one produces a
+# tree that resolves cleanly and still installs a dependency graph neither side
+# ever tested. `-merge` makes git stop trying: the merge stops with the file
+# unmerged, and the resolution is to check out one side and regenerate.
+#
+#   git checkout --theirs web/package-lock.json && (cd web && npm install)
+#
+# Do NOT run `npm audit fix --force` afterwards — it proposes downgrading Next
+# to 9.3.3 (2020) to clear transitive postcss/sharp advisories, which nothing in
+# web/src would build against. See the web/ section in AGENTS.md.
+package-lock.json -merge
