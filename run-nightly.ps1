@@ -49,6 +49,10 @@
                           tests/nightly-smoke.ps1 drive a stub worker so the
                           forced-failure path can be exercised without spending
                           money or hitting live job boards.
+    CAREEROPS_SCAN_CMD    Runtime used instead of `node` for `scan.mjs`. Lets a
+                          test drive a stub that exits 0 without appending to
+                          scan-runs.tsv, exercising the "scan claimed success but
+                          never ran" path.
     CAREEROPS_VAULT_DIR   Redirects vault output (decisions.jsonl,
                           morning-review.md) so tests do not pollute the vault.
     CAREEROPS_DATA_DIR    Redirects pipeline.md, applications.md (via
@@ -58,9 +62,10 @@
                           real ~176-row queue / 11-row tracker. Defaults to
                           $ProjectDir\data — byte-identical to the pre-override
                           paths when unset.
-    CAREEROPS_ALLOW_SCAN  Required to be '1' before scan will run. See the SCAN
-                          SAFETY GATE block below. This one is a safety
-                          interlock, not a test hook.
+  Removed 2026-08-01: CAREEROPS_ALLOW_SCAN. It gated an LLM+Playwright scan over
+  untrusted portals. Scan is now `node scan.mjs` — no LLM, no browser, no shell in
+  the untrusted-content path — so the risk the interlock existed for is gone. See
+  the SCAN block for why the gated path was removed rather than fixed.
 #>
 param(
     [switch]$ScanOnly,
@@ -108,7 +113,6 @@ $BatchPrompt   = "$ProjectDir\batch\batch-prompt.md"
 $PipelineFile  = "$DataDir\pipeline.md"
 $NeedsAttnFile = "$DataDir\needs-attention.md"
 $TrackerFile   = "$DataDir\applications.md"
-$ScanSysFile   = "$ProjectDir\modes\scan.md"
 $MorningReview = "$VaultDir\morning-review.md"
 $DecisionsLog  = "$VaultDir\decisions.jsonl"
 $DigestCursor  = "$VaultDir\digest-cursor.json"
@@ -118,6 +122,11 @@ $RunLog        = "$LogDir\nightly-$Date.log"
 
 # Worker command. Defaults to the real thing; overridable only for tests.
 $WorkerCmd     = if ($env:CAREEROPS_WORKER_CMD) { $env:CAREEROPS_WORKER_CMD } else { 'claude' }
+
+# Scan runtime, same convention as $WorkerCmd: `& $ScanCmd scan.mjs`. A stub that
+# exits 0 without appending to scan-runs.tsv is how the "exited 0 but never ran"
+# path gets exercised -- the exact shape of the 2026-08-01 silent failure.
+$ScanCmd       = if ($env:CAREEROPS_SCAN_CMD) { $env:CAREEROPS_SCAN_CMD } else { 'node' }
 
 # Setup
 New-Item -ItemType Directory -Force -Path $VaultDir | Out-Null
@@ -369,51 +378,33 @@ if (-not $EvalOnly) {
     if ($DryRun) {
         Write-Log "[DRY RUN] Would run: claude --print (scan)" 'Yellow'
     } else {
-        $scanMsg = "Today is $Date. Project directory: $ProjectDir. Execute the full portal scan as described in your system instructions. Report how many new jobs were added to data/pipeline.md."
-        # ==================== SCAN SAFETY GATE + SCOPING (P0, 2026-07-03) ====================
-        # SCAN drives the Playwright MCP over UNTRUSTED job portals. It previously ran
-        # --dangerously-skip-permissions (full tool access - the P0). Two changes:
+        # ============ SCAN: deterministic, no LLM, no browser (rewritten 2026-08-01) ============
+        # This used to be `claude --print` driving the Playwright MCP over UNTRUSTED job
+        # portals, which is why it carried a P0 interlock (CAREEROPS_ALLOW_SCAN) and a
+        # scoped allowlist marked UNVERIFIED HEADLESS. Verifying it settled the question
+        # the other way: the scoped allowlist (Read,Write,Edit,WebFetch,WebSearch,
+        # mcp__playwright) has no shell, so the worker could not run `node scan.mjs` --
+        # the one thing scan mode exists to do. It reported "Blocked. Both shells denied"
+        # in prose, exited 0, and this script logged "Scan complete / 0 new jobs" and
+        # carried on. Non-functional AND silent.
         #
-        #   1. INTERLOCK: scan REFUSES to run unless CAREEROPS_ALLOW_SCAN=1 is set explicitly.
-        #      This is defense-in-depth on top of the scheduled task being Disabled: two
-        #      independent locks (task Disabled AND this gate) instead of relying on one.
-        #      Re-enabling the task alone will NOT fire a scan.
+        # scan.mjs is the zero-token scanner (Greenhouse/Ashby/Lever/Workday APIs). Calling
+        # it directly removes the LLM, the browser, and the shell from the untrusted-content
+        # path entirely, so the P0 the interlock guarded no longer exists and the interlock
+        # is gone with it. Deterministic wrapper fetches, deterministic code decides.
         #
-        #   2. SCOPED command (pre-staged, ACTIVE below): replaces skip-permissions with an
-        #      allowlist + dontAsk, no Bash. UNVERIFIED HEADLESS - the dontAsk / project-MCP
-        #      trust behavior for the Playwright MCP has not been tested end-to-end. The
-        #      --dangerously-skip-permissions fallback is kept commented out below.
-        #
-        # REACTIVATION CHECKLIST (do these when you resume career-ops for real usage):
-        #   [ ] $env:CAREEROPS_ALLOW_SCAN = '1'
-        #   [ ] run: .\run-nightly.ps1 -ScanOnly   (watch for MCP permission prompts / hangs)
-        #   [ ] confirm new jobs land in data/pipeline.md and no unexpected tool calls occur
-        #   [ ] once verified, DELETE the commented skip-permissions fallback block below
-        #   [ ] bundle with the correctness-spec rewrite (tracker frozen / drain / filter leak)
-        # Tracking: wiki/meta/2026-07-03-portfolio-fix-matrix.md (career-ops P0).
-        # ====================================================================================
-        if ($env:CAREEROPS_ALLOW_SCAN -ne '1') {
-            throw "SCAN blocked: unverified headless scan path (P0 residual). Set CAREEROPS_ALLOW_SCAN=1 to run scan, after reading the SCAN SAFETY GATE in run-nightly.ps1."
-        }
+        # SCOPE NOTE: portals.yml still lists ~30 companies no zero-token provider handles
+        # (CrowdStrike, Palo Alto, Tenable, ...). scan.mjs prints them as a WebSearch
+        # handoff list and does NOT fetch them. That is a real gap, but not a regression:
+        # the LLM path never once scanned them successfully. Handle them with a watched
+        # `/career-ops scan` when you want them, not from an unattended 6am job.
+        # =======================================================================================
+        $runsFile   = "$ProjectDir\data\scan-runs.tsv"
+        $runsBefore = 0
+        if (Test-Path $runsFile) { $runsBefore = @(Get-Content $runsFile | Where-Object { $_.Trim() }).Count }
 
-        # --- Scoped scan (pre-staged; VERIFY headless before trusting) ---
-        & claude --print `
-            --allowedTools "Read,Write,Edit,WebFetch,WebSearch,mcp__playwright" `
-            --permission-mode dontAsk `
-            --append-system-prompt-file $ScanSysFile `
-            $scanMsg `
-            | Out-File $scanLog -Encoding utf8
+        & $ScanCmd scan.mjs *>&1 | Tee-Object -FilePath $scanLog | Out-Null
         $scanExit = $LASTEXITCODE
-
-        # --- FALLBACK: full tool access over UNTRUSTED portals. UNSAFE. Do NOT uncomment
-        #     unless the scoped command above fails AND you accept the risk. Delete once the
-        #     scoped scan is verified working headless. ---
-        # & claude --print `
-        #     --dangerously-skip-permissions `
-        #     --append-system-prompt-file $ScanSysFile `
-        #     $scanMsg `
-        #     | Out-File $scanLog -Encoding utf8
-        # $scanExit = $LASTEXITCODE
 
         # A failed scan means the queue is not what this run assumes it is.
         # Continuing would evaluate a stale pipeline and report success.
@@ -422,7 +413,27 @@ if (-not $EvalOnly) {
             Add-NeedsAttention -Url '(scan)' -Stage 'scan' -Reason "scan exited $scanExit; see $scanLog"
             exit 1
         }
-        Write-Log "Scan complete. Log: $scanLog" 'Green'
+
+        # Exit 0 is not evidence. The blocked LLM scan exited 0 having done nothing, and
+        # "0 new jobs" is indistinguishable from a working scan on a quiet night -- which
+        # is exactly how this went unnoticed. scan.mjs appends one row per run to
+        # scan-runs.tsv with its own status, so require that row to exist and say
+        # 'completed'. A scan that cannot prove it ran is a failed scan.
+        $runsAfter = 0
+        if (Test-Path $runsFile) { $runsAfter = @(Get-Content $runsFile | Where-Object { $_.Trim() }).Count }
+        if ($runsAfter -le $runsBefore) {
+            Write-Log "FATAL: scan exited 0 but appended no row to data/scan-runs.tsv -- it did not run. See $scanLog" 'Red'
+            Add-NeedsAttention -Url '(scan)' -Stage 'scan' -Reason "scan produced no scan-runs.tsv row despite exit 0; see $scanLog"
+            exit 1
+        }
+        $lastRun    = (Get-Content $runsFile | Where-Object { $_.Trim() })[-1]
+        $runStatus  = ($lastRun -split "`t")[1]
+        if ($runStatus -ne 'completed') {
+            Write-Log "FATAL: scan recorded status '$runStatus' (expected 'completed'). See $scanLog" 'Red'
+            Add-NeedsAttention -Url '(scan)' -Stage 'scan' -Reason "scan-runs.tsv status '$runStatus'; see $scanLog"
+            exit 1
+        }
+        Write-Log "Scan complete (scan-runs.tsv status=$runStatus). Log: $scanLog" 'Green'
     }
 
     $after = @(Get-PipelineUrls -State 'pending')
