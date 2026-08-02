@@ -814,6 +814,35 @@ Write-Log "=== Done ===" 'Green'
 Write-Trace 'tail: about to exit 0'
 exit 0
 
+} catch {
+    # A terminating error -- a `throw`, a Set-StrictMode violation, any cmdlet
+    # failing under $ErrorActionPreference='Stop' -- otherwise reaches stderr
+    # only. The scheduled task redirects nothing, so stderr is discarded: the
+    # run log kept whatever line it had last written and simply stopped, with no
+    # reason and no '=== Done ==='. On disk a failed run and a hung run were
+    # indistinguishable, which is how three consecutive mornings of "SCAN
+    # blocked: unverified headless scan path" read as a stall instead of a
+    # config gap (2026-07-30..08-01, every run dead at +3s).
+    #
+    # Not a rethrow: rethrowing writes the same record to the same unread
+    # stderr and still exits 1. Logging it here is the only way the reason
+    # reaches a file the owner actually reads the next morning.
+    $err = $_
+    try {
+        Write-Log "FATAL: run aborted -- $($err.Exception.Message)" 'Red'
+        $inv = $err.InvocationInfo
+        if ($inv) {
+            $src  = if ($inv.ScriptName) { $inv.ScriptName } else { '<unknown>' }
+            $stmt = if ($inv.Line) { $inv.Line.Trim() } else { '' }
+            Write-Log "       at ${src}:$($inv.ScriptLineNumber)  $stmt" 'Red'
+        }
+    } catch {
+        # Write-Log itself failed (unwritable log dir, full disk). Console is the
+        # last resort -- never let the error reporter swallow the error.
+        Write-Error "FATAL: run aborted -- $($err.Exception.Message)"
+    }
+    Write-Trace "fatal: $($err.Exception.Message)"
+    exit 1
 } finally {
     # Traced individually: `exit` inside a try runs this block first, so a
     # process that has logged "about to exit" and never dies is stuck HERE, and
