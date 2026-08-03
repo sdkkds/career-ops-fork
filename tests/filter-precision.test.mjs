@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { classifyTitle } from '../lib/filter.mjs';
+import { gateStatusFor } from '../scan.mjs';
 
 const ADMIT = [
   'Senior Product Manager',
@@ -244,13 +245,13 @@ test('the Solutions Architect qualifier tightening does not affect other role te
 // term at all" (skipped_role) from "role term present, no seniority"
 // (skipped_seniority). Both were previously collapsed into
 // 'skipped_seniority' by scan.mjs, mislabeling the audit trail. This
-// mirrors scan.mjs's gateStatusFor() logic directly against classifyTitle's
-// return shape so the status-selection contract has direct test coverage.
-function gateStatusFor(gate) {
-  if (gate.negative) return 'skipped_negative';
-  if (!gate.roleTerm) return 'skipped_role';
-  return 'skipped_seniority';
-}
+// exercises scan.mjs's real gateStatusFor() against classifyTitle's return
+// shape so the status-selection contract has direct test coverage.
+//
+// This used to be a hand-copied mirror of that function. It drifted the moment
+// a fourth status (skipped_company_qualifier) was added on 2026-08-03: the copy
+// kept returning the old answer and passing, while the real scanner returned
+// the new one. A mirror of logic under test only proves the mirror works.
 
 test('status selection distinguishes skipped_role vs skipped_seniority vs skipped_negative', () => {
   const noRoleTerm = classifyTitle('Principal AI Security Specialist');
@@ -286,4 +287,86 @@ test('the security signal does not fire on "soc" hiding inside "associate"', () 
   // The real SOC sense must survive.
   assert.equal(classifyTitle('Director, Security Operations Center (SOC)').securitySignal, true);
   assert.equal(classifyTitle('Senior Program Manager, SOC Automation').securitySignal, true);
+});
+// ---------------------------------------------------------------------------
+// Company-scoped qualifier narrowing (2026-08-03). Titles below are verbatim
+// from data/scan-history.tsv for the 08-02/08-03 scans, and the scores are the
+// evaluations those postings actually produced.
+// ---------------------------------------------------------------------------
+
+const QUALIFIER_COMPANIES = ['Amazon', 'Annapurna Labs', 'Audible', 'JPMorgan', 'ServiceNow'];
+
+test('company qualifier rule is a no-op without config', () => {
+  // The rule must never fire on its own. An absent, empty, or malformed list
+  // leaves every existing verdict byte-identical -- this is what keeps the
+  // narrowing opt-in and keeps `classifyTitle(title)` behaviour unchanged.
+  const title = 'Technical Program Manager III, Amazon CloudWatch';
+  assert.equal(classifyTitle(title).admit, true);
+  assert.equal(classifyTitle(title, { company: 'Amazon.com Services LLC' }).admit, true);
+  assert.equal(classifyTitle(title, { company: 'Amazon.com Services LLC', qualifierCompanies: [] }).admit, true);
+  assert.equal(classifyTitle(title, { company: 'Amazon.com Services LLC', qualifierCompanies: 'Amazon' }).admit, true);
+});
+
+test('unqualified generic PM titles from listed companies are rejected', () => {
+  const cases = [
+    ['Technical Program Manager III, Amazon CloudWatch', 'Amazon.com Services LLC'],          // scored 2.8/5
+    ['Senior Technical Infrastructure Program Manager', 'Amazon.com Services LLC'],           // scored 1.5/5
+    ['Sr. Product Manager - Tech, RL Products, Project Leo', 'Amazon Kuiper Commercial Services LLC'], // 1.8/5
+    ['Sr Staff Product Manager - Cross-APEX Licensing and Entitlement', 'ServiceNow'],        // scored 3.1/5
+    ['Lead Techical Program Manager', 'JPMorgan Chase'],
+  ];
+  for (const [title, company] of cases) {
+    const gate = classifyTitle(title, { company, qualifierCompanies: QUALIFIER_COMPANIES });
+    assert.equal(gate.admit, false, `expected reject: ${company} - ${title}`);
+    assert.equal(gate.companyQualifierMissing, true, `expected qualifier reason: ${title}`);
+  }
+});
+
+test('qualified titles from the same companies still admit', () => {
+  // The whole point of a qualifier rule rather than a blocklist: these
+  // employers do post on-target roles, and those must survive untouched.
+  const cases = [
+    ['Senior Security Program Manager, AWS', 'Amazon Web Services, Inc.'],
+    ['Principal Product Manager, Machine Learning Platform', 'Amazon.com Services LLC'],
+    ['Director, Product Management - AI', 'ServiceNow'],
+    ['Senior Program Manager, Cybersecurity Risk', 'JPMorgan Chase'],
+  ];
+  for (const [title, company] of cases) {
+    const gate = classifyTitle(title, { company, qualifierCompanies: QUALIFIER_COMPANIES });
+    assert.equal(gate.admit, true, `expected admit: ${company} - ${title}`);
+    assert.equal(gate.companyQualifierMissing, false, `must not flag an admitted title: ${title}`);
+  }
+});
+
+test('the rule is scoped to listed companies only', () => {
+  // An identical unqualified title from an unlisted company keeps admitting.
+  // This is the guard on "security is a signal, never a gate" -- the standing
+  // ruling still holds everywhere the user has not named an exception.
+  const title = 'Senior Technical Program Manager';
+  assert.equal(classifyTitle(title, { company: 'Okta', qualifierCompanies: QUALIFIER_COMPANIES }).admit, true);
+  assert.equal(classifyTitle(title, { company: 'Bugcrowd', qualifierCompanies: QUALIFIER_COMPANIES }).admit, true);
+  assert.equal(classifyTitle(title, { company: 'Amazon.com Services LLC', qualifierCompanies: QUALIFIER_COMPANIES }).admit, false);
+});
+
+test('subsidiary entities match by substring', () => {
+  const title = 'Senior Product Manager';
+  for (const company of [
+    'Amazon.com Services LLC - A57', 'Amazon Data Services, Inc.',
+    'Amazon Development Center U.S., Inc.', 'Annapurna Labs (U.S.) Inc.',
+    'Audible, Inc. - B13', 'JPMorgan Chase Bank, N.A.',
+  ]) {
+    assert.equal(classifyTitle(title, { company, qualifierCompanies: QUALIFIER_COMPANIES }).admit, false, company);
+  }
+});
+
+test('qualifier rejection reports its own status, not skipped_role', () => {
+  const gate = classifyTitle('Technical Program Manager III, Amazon CloudWatch', {
+    company: 'Amazon.com Services LLC', qualifierCompanies: QUALIFIER_COMPANIES,
+  });
+  assert.equal(gateStatusFor(gate), 'skipped_company_qualifier');
+  // A negative term still wins -- it is the stronger signal.
+  const negative = classifyTitle('Junior Product Manager', {
+    company: 'Amazon.com Services LLC', qualifierCompanies: QUALIFIER_COMPANIES,
+  });
+  assert.equal(gateStatusFor(negative), 'skipped_negative');
 });

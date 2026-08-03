@@ -483,14 +483,44 @@ foreach ($stale in @($staleSel.rows)) {
     Add-NeedsAttention -Url $stale.url -Stage 'crash-recovery' -Reason 'left in-progress by a run that did not finish'
 }
 
-$listSel = Get-PipelineSelection -Limit $MaxJobs
+# Fetch the WHOLE actionable queue, rank it, and only then apply -MaxJobs.
+# Selecting first and ranking second would just reorder the same N rows and
+# change nothing about which roles get evaluated. lib/pipeline-state.mjs
+# defaults --limit to 10, so the ceiling has to be passed explicitly.
+$listSel = Get-PipelineSelection -Limit 100000
 if ($null -eq $listSel) {
     Write-Log "FATAL: could not list actionable jobs from $PipelineFile." 'Red'
     exit 1
 }
 Report-UnusablePipelineRows -Selection $listSel -Phase 'dispatch'
-$jobs = @($listSel.rows)
-Write-Log "$($jobs.Count) actionable job(s) (pending + retryable failures)."
+
+# Rank by security > AI/ML > neither, stable within a tier so queue order still
+# decides among equals. Order only: nothing is dropped, so a low-tier row still
+# evaluates on a later night. See lib/prioritise-queue.mjs for why.
+$allRows = @($listSel.rows)
+$ranked = $null
+if ($allRows.Count -gt 0) {
+    $ranked = ($listSel | ConvertTo-Json -Depth 10 -Compress) | & node lib/prioritise-queue.mjs
+    if ($LASTEXITCODE -ne 0 -or -not $ranked) {
+        # Degrade to queue order rather than failing the run: the prioritiser is
+        # an optimisation, and a night of FIFO evaluation is a far better outcome
+        # than no evaluation at all. Loud, because silently unranked is exactly
+        # the "looks fine, quietly worse" failure this session spent hours on.
+        Write-Log "WARN: prioritiser failed (exit $LASTEXITCODE) — falling back to queue order." 'Yellow'
+        $jobs = @($allRows | Select-Object -First $MaxJobs)
+    } else {
+        $jobs = @((($ranked | Out-String) | ConvertFrom-Json).rows | Select-Object -First $MaxJobs)
+    }
+} else {
+    $jobs = @()
+}
+
+$tierName = @{ 2 = 'security'; 1 = 'ai/ml'; 0 = 'neither' }
+Write-Log "$($allRows.Count) actionable job(s) (pending + retryable failures); dispatching $($jobs.Count)."
+foreach ($j in $jobs) {
+    $t = if ($null -ne (Get-Prop $j 'tier')) { $tierName[[int](Get-Prop $j 'tier')] } else { 'unranked' }
+    Write-Log "  queued [$t] $($j.company) - $($j.title)"
+}
 
 # ---- EVALUATE ----
 

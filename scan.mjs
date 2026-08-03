@@ -1671,8 +1671,16 @@ function guardStatusFor(code) {
 // Solutions Architect, AWS" pre-fix) is a role-term miss, not a seniority
 // miss — those were previously both mislabeled 'skipped_seniority', which
 // corrupted the audit trail (2026-07-26 scan: 67+ mislabeled rows).
-function gateStatusFor(gate) {
+// Exported so tests/filter-precision.test.mjs can assert the real function
+// instead of a hand-copied mirror. The mirror drifted the moment a fourth
+// status was added (2026-08-03) and the duplicate kept passing on stale logic.
+export function gateStatusFor(gate) {
   if (gate.negative) return 'skipped_negative';
+  // Checked before the role/seniority reasons because it is the more specific
+  // and more actionable one: the title DID carry a role term, and the reason it
+  // was dropped is a portals.yml policy the user can see and change. Collapsing
+  // it into skipped_role would repeat the 2026-07-26 mislabeling mistake.
+  if (gate.companyQualifierMissing) return 'skipped_company_qualifier';
   if (!gate.roleTerm) return 'skipped_role';
   return 'skipped_seniority';
 }
@@ -1949,7 +1957,10 @@ async function main() {
         // out of totalFilteredTitle (a distinct counter) and recorded to
         // scan-history like every other skip reason so they're auditable and
         // deduped on rescan.
-        const gate = classifyTitle(job.title);
+        const gate = classifyTitle(job.title, {
+          company: job.company,
+          qualifierCompanies: config.qualifier_required_companies,
+        });
         if (!gate.admit) {
           totalFilteredGate++;
           gateSkippedOffers.push({
