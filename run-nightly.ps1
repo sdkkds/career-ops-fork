@@ -21,6 +21,16 @@
 .PARAMETER MaxJobs    Max jobs to evaluate per run (default: 10).
 .PARAMETER DryRun     Print what would run without calling the worker or mutating state.
 
+.NOTES
+  Do not launch this through a pipe (`... | Out-String`). Proven 2026-08-04: a
+  piped launcher returns when the last process holding the inherited stdout
+  handle dies, not when this script exits. `claude --print` starts MCP servers
+  that Windows does not reparent when it exits, so they outlive the run holding
+  that handle and the launcher looks hung for hours. This script exits correctly
+  -- the tracer shows it reaching `finally: lock removed` every time. Launch via
+  run-nightly-hc.ps1, Task Scheduler (console, no pipe), or Start-Process with
+  -RedirectStandardOutput.
+
 .OUTPUTS
   Exit codes — the scheduled task should distinguish these:
 
@@ -172,17 +182,86 @@ function Write-Log {
 # script to finish its work and still not exit. Appends and swallows its own
 # errors -- a tracer must never be the reason a run fails.
 $TraceLog = "$LogDir\nightly-trace-$Date.log"
+
+# Descendants seen at any point in the run: PID -> creation time. Creation time
+# is stored because Windows recycles PIDs, and a recycled PID would otherwise
+# read as "our grandchild is still alive" forever.
+$script:TraceSeen = @{}
+
+# Counting direct children only (ParentProcessId=$PID) was blind to the exact
+# thing this tracer exists to catch (proven 2026-08-04). `claude --print` starts
+# MCP servers as ITS children, so they are our grandchildren; when claude exits,
+# Windows does NOT reparent them — their ParentProcessId keeps pointing at a dead
+# PID, so they fall out of any walk rooted at us while still holding the stdout
+# handle they inherited. The 2026-08-04 run logged children=0 on every line and
+# still pinned its launcher open for 3h24m.
+#
+# So count three things, not one:
+#   children — direct children, what the old tracer reported
+#   tree     — every live descendant reachable by walking ParentProcessId down
+#   orphans  — processes we saw in the tree earlier that are still alive but no
+#              longer reachable from us. These are the dangerous ones: invisible
+#              to a tree walk, still capable of holding an inherited handle.
+function Get-TraceDescendants {
+    $all = Get-CimInstance Win32_Process -ErrorAction Stop
+    $byParent = @{}
+    foreach ($p in $all) {
+        $key = [string]$p.ParentProcessId
+        if (-not $byParent.ContainsKey($key)) { $byParent[$key] = @() }
+        $byParent[$key] += $p
+    }
+    # Breadth-first from us. $seenPids guards against a recycled PID forming a
+    # cycle in the parent map and spinning this forever.
+    $tree     = @()
+    $seenPids = @{ "$PID" = $true }
+    $queue    = @([string]$PID)
+    while ($queue.Count -gt 0) {
+        $current = $queue[0]
+        $queue   = @($queue | Select-Object -Skip 1)
+        foreach ($child in @($byParent[$current])) {
+            if ($null -eq $child) { continue }
+            $cpid = [string]$child.ProcessId
+            if ($seenPids.ContainsKey($cpid)) { continue }
+            $seenPids[$cpid] = $true
+            $tree += $child
+            $queue += $cpid
+        }
+    }
+    return @{ All = $all; Tree = $tree }
+}
+
 function Write-Trace {
     param([string]$Stage)
     try {
-        $descendants = -1
+        $children = -1
+        $treeCount = -1
+        $orphans = -1
         try {
-            $mine = (Get-CimInstance Win32_Process -Filter "ParentProcessId=$PID" -ErrorAction Stop)
-            $descendants = @($mine).Count
+            $snap = Get-TraceDescendants
+            $tree = $snap.Tree
+            $treeCount = @($tree).Count
+            $children  = @($tree | Where-Object { [string]$_.ParentProcessId -eq [string]$PID }).Count
+
+            # Remember everything currently reachable, with its creation time.
+            foreach ($p in $tree) { $script:TraceSeen["$($p.ProcessId)"] = $p.CreationDate }
+
+            # Anything remembered, still running with the SAME creation time, and
+            # no longer in the tree, is an orphaned descendant.
+            $liveNow = @{}
+            foreach ($p in $snap.All) { $liveNow["$($p.ProcessId)"] = $p.CreationDate }
+            $inTree = @{}
+            foreach ($p in $tree) { $inTree["$($p.ProcessId)"] = $true }
+            $orphans = 0
+            foreach ($key in @($script:TraceSeen.Keys)) {
+                if ($inTree.ContainsKey($key)) { continue }
+                if (-not $liveNow.ContainsKey($key)) { continue }
+                if ($liveNow[$key] -ne $script:TraceSeen[$key]) { continue }  # PID reused
+                $orphans++
+            }
         } catch { }
         $elapsed = [math]::Round(((Get-Date) - $ScriptStart).TotalSeconds, 1)
-        "{0}  +{1,8}s  pid={2}  children={3}  {4}" -f `
-            (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $elapsed, $PID, $descendants, $Stage |
+        "{0}  +{1,8}s  pid={2}  children={3}  tree={4}  orphans={5}  {6}" -f `
+            (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $elapsed, $PID, $children, $treeCount, $orphans, $Stage |
             Out-File $TraceLog -Encoding utf8 -Append -ErrorAction Stop
     } catch { }
 }
