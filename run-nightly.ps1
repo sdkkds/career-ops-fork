@@ -160,6 +160,19 @@ $env:CAREER_OPS_TRACKER = $TrackerFile
 # that resolve against the real reports/ dir instead of 404ing relative to a
 # temp data dir. See CAREER_OPS_REPORTS_ROOT in merge-tracker.mjs.
 $env:CAREER_OPS_REPORTS_ROOT = $ProjectDir
+# The memsearch plugin's SessionStart hook (session-start.sh -> start_watch)
+# launches a persistent `memsearch watch` daemon for every session, headless
+# ones included. Its stop path is a no-op on this platform: stop_watch() sweeps
+# with `pgrep`, which Git Bash does not ship, and the failure is swallowed by
+# `|| true`. Each `claude --print` below would therefore strand a daemon that
+# outlives the run at ~1.5 GB, growing ~1 GB/day, until Windows starts failing
+# allocations for everything else (three of them cost a Claude session on
+# 2026-08-12, 5s after a Resource-Exhaustion-Detector event).
+#
+# The plugin sets this exact variable when it spawns a headless claude itself
+# (hooks/stop.sh:147) — same reasoning, same mechanism, so this is the
+# supported way to opt out rather than a workaround.
+$env:MEMSEARCH_NO_WATCH = '1'
 
 function Write-Log {
     param([string]$Msg, [string]$Color = 'White')
