@@ -138,3 +138,4 @@ plan/
 # Personal CVs rendered by workers into repo root (batch-prompt.md points at /tmp/,
 # a Unix path that doesn't exist on Windows) - one git add -A from leaking
 cv-*.html
+.gstack/
