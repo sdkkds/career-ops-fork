@@ -356,6 +356,7 @@ const USER_PATHS = [
   'cv-beta.md',             // CV revision history
   'cv-azure-gov-rewrite-proposed.md',
   'qa-fixtures/',           // frozen QA data corpus — an update must never overwrite it
+  'batch/fetch-oracle-ce-jd.mjs', // local: one-requisition Oracle CE JD fetch (dead-JD recovery)
 ];
 
 function parseVersionFile(raw) {
