@@ -7,7 +7,7 @@
  * newly introduced system paths without touching user data.
  */
 
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 
 let passed = 0;
 let failed = 0;
@@ -45,6 +45,26 @@ const systemPaths = extractArray('SYSTEM_PATHS');
 const userPaths = extractArray('USER_PATHS');
 const bootstrapPaths = extractArray('BOOTSTRAP_PATHS');
 
+// Every concrete (non-directory) manifest entry (SYSTEM_PATHS or
+// BOOTSTRAP_PATHS) must exist in the working tree. A path deleted upstream
+// but left in the manifest survives as a permanent `error: pathspec ...` in
+// every user's upgrade output (#2002). Directory entries (trailing '/') are
+// exempt: git checkout of a directory pathspec tolerates content drift
+// inside it. Add an entry to ALLOWED_MISSING_ENTRIES only with a comment
+// justifying why it may legitimately be absent.
+const ALLOWED_MISSING_ENTRIES = new Set([]);
+for (const [listName, entries] of [['SYSTEM_PATHS', systemPaths], ['BOOTSTRAP_PATHS', bootstrapPaths]]) {
+  for (const entry of entries) {
+    if (entry.endsWith('/')) continue;
+    if (ALLOWED_MISSING_ENTRIES.has(entry)) continue;
+    if (existsSync(entry)) {
+      pass(`${listName} entry exists on disk: ${entry}`);
+    } else {
+      fail(`${listName} entry missing from tree (stale manifest entry, #2002): ${entry}`);
+    }
+  }
+}
+
 const requiredSystemPaths = [
   'modes/email.md',
   'modes/followup.md',
@@ -64,6 +84,7 @@ const requiredSystemPaths = [
   '.qwen/',
   '.antigravitycli/skills/',
   '.grok/skills/',
+  '.cursor/skills/',
   'tracker-columns-tests.mjs',
   'updater-migration-tests.mjs',
   'README.ar.md',
@@ -81,6 +102,7 @@ const requiredSystemPaths = [
 
 const requiredBootstrapPaths = [
   '.agents/',
+  '.cursor/skills/',
   '.opencode/skills/',
   '.antigravitycli/skills/',
   '.grok/skills/',
@@ -146,7 +168,7 @@ const twoPassManifestChecks = [
   },
   {
     name: 'revertPaths uses git checkout HEAD (not just --) to reset index+worktree (#915)',
-    pattern: /git\('checkout',\s*'HEAD',\s*'--'/,
+    pattern: /\b(?:git|runGit)\('checkout',\s*'HEAD',\s*'--'/,
   },
   {
     name: 'apply commit is scoped to update paths, not bare commit (#915)',
@@ -174,8 +196,30 @@ const twoPassManifestChecks = [
   {
     // execFileSync inherits stderr, so an expected per-path skip printed git's
     // raw pathspec error right before the success banner (#1998).
+    // The trailing spread is the #2337 preserve-exclusions; the property this
+    // pins is the runner (gitQuiet, not git) and the ref, not the arity.
     name: 'per-path checkout pipes stderr so expected skips stay quiet (#1998)',
-    pattern: /gitQuiet\('checkout',\s*'FETCH_HEAD',\s*'--',\s*path\)/,
+    pattern: /gitQuiet\('checkout',\s*'FETCH_HEAD',\s*'--',\s*path(?:,\s*\.\.\.\w+)?\)/,
+  },
+  {
+    // #2337: a system file this install edited must be listed and backed up
+    // before the checkout, not overwritten in silence.
+    name: 'locally edited system files are detected before checkout (#2337)',
+    pattern: /const atRisk = locallyModifiedSystemFiles\(updatePaths, 'FETCH_HEAD'\)/,
+  },
+  {
+    name: 'the local copy is saved as .bak before any overwrite (#2337)',
+    pattern: /copyFileSync\([\s\S]{0,80}?backup\)/,
+  },
+  {
+    name: 'overwriting a locally edited system file requires --force (#2337)',
+    pattern: /updateForce[\s\S]{0,400}?preservedPaths\.push\(\.\.\.atRisk\)/,
+  },
+  {
+    // Excluded paths must stay out of the scoped commit too, or the
+    // "auto-update" commit records the very edit the user kept (#2337).
+    name: 'preserved paths are excluded from the update commit (#2337)',
+    pattern: /pathsToStage = \[\.\.\.updated, \.\.\.preserveSpecs\]/,
   },
   {
     name: 'skipped upstream-absent paths are summarized explicitly (#1998)',
@@ -200,7 +244,7 @@ const twoPassManifestChecks = [
     // paths HEAD lacks, so files the update introduced under a directory
     // pathspec survived the rollback as staged additions (#2015).
     name: 'revertPaths clears additions HEAD lacks under a directory pathspec (#2015)',
-    pattern: /removeAdditionsNotInHead\(p, protectedPaths\)/,
+    pattern: /removeAdditionsNotInHead\(p, protectedPaths, ctx\)/,
   },
   {
     name: 'removeAdditionsNotInHead only targets additions, never modifications (#2015)',
@@ -259,6 +303,10 @@ const allowedSystemUserOverlap = new Set([
   // the updater ships these two, but never the real session files alongside them.
   'interview-prep/sessions/.gitkeep',
   'interview-prep/sessions/README.md',
+  // Same pattern for the user-layer documents/ intake dir (#1723): the
+  // updater ships the scaffold, never the user's source documents.
+  'documents/.gitkeep',
+  'documents/README.md',
 ]);
 let hasSystemUserCollision = false;
 for (const systemPath of systemPaths) {

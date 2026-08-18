@@ -2,7 +2,7 @@
 // Moved verbatim from test-all.mjs (issue #1440); no framework by design:
 // the suite must run on a fresh clone with only Node.
 import { execFileSync } from 'child_process';
-import { existsSync } from 'fs';
+import { existsSync, readdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -96,10 +96,11 @@ export function finish() {
 // WSL bash. That fallback launches the script but not the environment: WSL has
 // its own PATH, so the Windows `node` (and any stub binary a test injects via
 // PATH) is invisible, and batch-runner.sh dies with `node: command not found`,
-// exit 127. run() converts that to null and the assertion reports an empty
-// argv -- which reads as a routing bug in the code under test rather than a
-// missing shell. That is what all five spend_tier tests were doing on a machine
-// where Git Bash was installed the whole time.
+// exit 127. run() converts that to null, the caller does `|| ''`, and the
+// assertion reports an empty argv -- which reads as a routing bug in the code
+// under test rather than a missing shell. That is what all five spend_tier
+// tests were doing on a machine where Git Bash was installed the whole time
+// (#2344).
 //
 // Kept as fixed-shape literals joined onto %USERPROFILE% / %SCOOP% rather than
 // a PATH search, so this stays an allowlist of trusted literals (see
@@ -159,44 +160,74 @@ function resolveAllowedExecutable(cmd) {
  * @param {object} [opts={}] - Extra child_process options.
  * @returns {string|null} Trimmed stdout, or null when the command fails.
  */
-let lastFailure = null;
-
-/**
- * Details of the most recent run() failure, or null if the last call worked.
- *
- * run() collapses every failure mode -- nonzero exit, timeout, ENOENT -- into
- * a bare null, and callers typically do `run(...) || ''`. An environment fault
- * then reaches the assertion as an empty string and gets reported as a defect
- * in the code under test: five spend_tier tests spent this session claiming
- * "did not route to haiku" when the routing was correct and the real event was
- * `node: command not found`, exit 127, inside a fallback shell. Keeping the
- * status and stderr somewhere retrievable makes that difference visible without
- * changing run()'s string|null contract or the tests that depend on it.
- *
- * @returns {{status: number|null, signal: string|null, stderr: string, message: string}|null}
- */
-export function lastRunFailure() { return lastFailure; }
-
 export function run(cmd, args = [], opts = {}) {
+  // Cleared as the very first statement. resolveAllowedExecutable() throws for a
+  // command outside the allowlist, so a reset placed after it is skipped on that
+  // path and the previous run's diagnostics survive, which would let a later
+  // formatRunFailure() attribute an unrelated child's stderr to whatever failed
+  // most recently. A stale diagnostic is worse than none.
+  //
+  // Clearing here rather than on the success path also keeps the execFileSync
+  // call below byte-identical: editing that line makes CodeQL re-attribute its
+  // long-standing "uncontrolled command line" finding to whichever PR touched
+  // it. Nothing about what reaches the child changes either way, since the
+  // executable is still allowlisted and the arguments are still an argv vector.
+  lastFailure = null;
   const exe = resolveAllowedExecutable(cmd);
   try {
-    const out = execFileSync(exe, args, { cwd: ROOT, encoding: 'utf-8', timeout: 30000, ...opts }).trim();
-    lastFailure = null;
-    return out;
+    return execFileSync(exe, args, { cwd: ROOT, encoding: 'utf-8', timeout: 30000, ...opts }).trim();
   } catch (e) {
+    // execFileSync attaches the child's streams and exit status to the error.
+    // Keep them: callers report failure as `<name> crashed`, and without this a
+    // CI-only failure arrives as a single line with no stack, no assertion text,
+    // and no exit code, which is not enough to act on.
     lastFailure = {
-      status: e.status ?? null,
-      signal: e.signal ?? null,
-      stderr: (e.stderr || '').toString().trim(),
-      message: e.message || '',
+      status: e?.status ?? null,
+      signal: e?.signal ?? null,
+      stdout: e?.stdout == null ? '' : String(e.stdout),
+      stderr: e?.stderr == null ? '' : String(e.stderr),
     };
-    // Opt-in so suites that provoke failures on purpose stay quiet by default.
-    if (process.env.CAREEROPS_TEST_TRACE === '1') {
-      console.error(`    [run] ${exe} failed: status=${lastFailure.status} signal=${lastFailure.signal} stderr=${lastFailure.stderr.slice(0, 300)}`);
-    }
     warnFallbackShell(exe);
     return null;
   }
+}
+
+/** Diagnostics from the most recent failed run(), or null if the last run succeeded. */
+let lastFailure = null;
+
+/**
+ * Diagnostics for the most recently failed run().
+ *
+ * Cleared by a successful run so a stale record is never attributed to a later
+ * command. The suite is sequential, so "most recent" is unambiguous.
+ *
+ * @returns {{status: number|null, signal: string|null, stdout: string, stderr: string}|null}
+ */
+export function lastRunFailure() {
+  return lastFailure;
+}
+
+/**
+ * The last failure rendered for interpolation into a failure message, or an
+ * empty string when nothing has failed, so a caller can append it
+ * unconditionally without changing its message on the success path.
+ *
+ * @param {number} [maxChars=2000] - Per-stream cap, keeping a runaway log readable.
+ * @returns {string}
+ */
+export function formatRunFailure(maxChars = 2000) {
+  if (!lastFailure) return '';
+  const clip = (s) => {
+    const t = String(s ?? '').trim();
+    if (!t) return '';
+    return t.length > maxChars ? `${t.slice(0, maxChars)}\n    ... (${t.length - maxChars} more chars)` : t;
+  };
+  const parts = [` (exit ${lastFailure.status ?? 'null'}${lastFailure.signal ? `, signal ${lastFailure.signal}` : ''})`];
+  const out = clip(lastFailure.stdout);
+  const err = clip(lastFailure.stderr);
+  if (out) parts.push(`\n    stdout: ${out.replace(/\n/g, '\n    ')}`);
+  if (err) parts.push(`\n    stderr: ${err.replace(/\n/g, '\n    ')}`);
+  return parts.join('');
 }
 
 /**
@@ -207,6 +238,38 @@ export function run(cmd, args = [], opts = {}) {
  */
 export function fileExists(path) { return existsSync(join(ROOT, path)); }
 
+/**
+ * Recursively collect files under `dir` whose basename matches `match`.
+ *
+ * Deterministic by construction: entries are sorted lexicographically at every
+ * level, so the result is identical on every run and every OS — the same
+ * property test-all.mjs's own `tests/` discovery relies on (#1440).
+ *
+ * A missing `dir` yields `[]` rather than throwing, so the caller reports its
+ * own contract failure (e.g. "discovery is empty") instead of the run dying
+ * mid-traversal with an ENOENT that says nothing about what was expected.
+ *
+ * @param {string} dir - Absolute directory to walk.
+ * @param {RegExp} match - Tested against each entry's basename.
+ * @param {Set<string>} [skipDirs] - Directory names never descended into.
+ * @returns {string[]} Absolute paths, parents before children.
+ */
+export function walkFiles(dir, match, skipDirs = new Set()) {
+  if (!existsSync(dir)) return [];
+  const out = [];
+  const entries = readdirSync(dir, { withFileTypes: true })
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (!skipDirs.has(entry.name)) out.push(...walkFiles(full, match, skipDirs));
+    } else if (match.test(entry.name)) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
 let bashCache = null;
 let bashSourceCache = null;
 
@@ -214,13 +277,13 @@ let bashSourceCache = null;
  * Which probe in getBash() produced the current bash, or null before the first
  * getBash() call.
  *
- * getBash() returns the bare string 'bash' from three different branches — the
- * WSL fallback, the PATH fallback, and the give-up path — so its return value
- * alone cannot tell a caller which shell it is about to run. On Windows those
- * are not interchangeable: 'bash' via WSL is a different OS with a different
- * PATH and a different mount scheme (/mnt/c/... vs /c/...). Recording the
- * branch is what lets a failure name the shell instead of leaving the reader
- * to infer it (#2344).
+ * getBash() returns the bare string 'bash' from three different branches -- the
+ * WSL probe, the PATH probe, and the give-up path -- so its return value alone
+ * cannot tell a caller which shell it is about to run. On Windows those are not
+ * interchangeable: 'bash' via WSL is a different OS with a different PATH and a
+ * different mount scheme (/mnt/c/... vs /c/...). Recording the branch is what
+ * lets a failure name the shell instead of leaving the reader to infer it
+ * (#2344).
  *
  * @returns {'posix'|'git-bash'|'wsl'|'path'|'unresolved'|null} Resolution source.
  */
@@ -228,6 +291,45 @@ export function bashSource() { return bashSourceCache; }
 
 /** Sources whose shell is ambiguous or foreign, and worth naming on failure. */
 const FALLBACK_BASH_SOURCES = new Set(['wsl', 'path', 'unresolved']);
+
+let warnedFallbackShell = false;
+
+/**
+ * Say out loud, once per process, that a failing shell command ran in a
+ * fallback shell rather than Git Bash.
+ *
+ * Unconditional by design. formatRunFailure() already surfaces the child's
+ * stderr to callers that ask for it, but the shell that produced it is still
+ * invisible, and the whole failure mode of #2344 is that nobody suspects the
+ * shell: it is missing, the script dies at `node`, run() returns null, `|| ''`
+ * turns that into an empty string, and the assertion accuses the code under
+ * test of a routing bug it does not have.
+ *
+ * Two things keep this from becoming noise in the suites that provoke command
+ * failures on purpose. It fires only when getBash() landed on a fallback -- a
+ * Git Bash resolved by literal path is unambiguous and stays silent, which is
+ * every correctly provisioned machine -- and it fires at most once per process.
+ *
+ * @param {string} exe - Executable that just failed.
+ * @returns {void}
+ */
+function warnFallbackShell(exe) {
+  if (warnedFallbackShell) return;
+  if (bashCache === null || exe !== bashCache) return;
+  if (!FALLBACK_BASH_SOURCES.has(bashSourceCache)) return;
+  warnedFallbackShell = true;
+  const where = {
+    wsl: 'WSL bash (`wsl -e bash`) -- a different OS with its own PATH',
+    path: '`bash` from PATH, provenance unknown',
+    unresolved: '`bash`, which no probe could confirm exists',
+  }[bashSourceCache];
+  console.error(`    [shell] this command ran under ${where},`);
+  console.error('            because no Git Bash was found at any known location.');
+  console.error('            The Windows `node` and any PATH-injected stub binary may be invisible there,');
+  console.error('            so scripts calling node die with `node: command not found` (exit 127) and the');
+  console.error('            assertion sees an empty result. Suspect the shell before the code under test.');
+  console.error('            Install Git for Windows, or see formatRunFailure() for the raw stderr.');
+}
 
 /**
  * Resolve the bash executable to use for shell-script checks, lazily.
@@ -265,44 +367,6 @@ export function getBash() {
   }
   bashSourceCache = 'unresolved';
   return (bashCache = 'bash');
-}
-
-let warnedFallbackShell = false;
-
-/**
- * Say out loud, once per process, that a failing shell command ran in a
- * fallback shell rather than Git Bash.
- *
- * Unconditional by design: the trace flag above only helps someone who already
- * suspects the environment, and the whole failure mode of #2344 is that nobody
- * suspects it -- the shell is missing, the script dies at `node`, run() returns
- * null, `|| ''` turns that into an empty string, and the assertion accuses the
- * code under test of a routing bug it does not have.
- *
- * Two things keep this from becoming noise in the suites that provoke command
- * failures on purpose. It fires only when getBash() landed on a fallback (a
- * Git Bash resolved by literal path is unambiguous and stays silent, which is
- * every correctly-provisioned machine), and it fires at most once per process.
- *
- * @param {string} exe - Executable that just failed.
- * @returns {void}
- */
-function warnFallbackShell(exe) {
-  if (warnedFallbackShell) return;
-  if (bashCache === null || exe !== bashCache) return;
-  if (!FALLBACK_BASH_SOURCES.has(bashSourceCache)) return;
-  warnedFallbackShell = true;
-  const where = {
-    wsl: 'WSL bash (`wsl -e bash`) -- a different OS with its own PATH',
-    path: '`bash` from PATH, provenance unknown',
-    unresolved: '`bash`, which no probe could confirm exists',
-  }[bashSourceCache];
-  console.error(`    [shell] this command ran under ${where},`);
-  console.error('            because no Git Bash was found at any known location.');
-  console.error('            The Windows `node` and any PATH-injected stub binary may be invisible there,');
-  console.error('            so scripts calling node die with `node: command not found` (exit 127) and the');
-  console.error('            assertion sees an empty result. Suspect the shell before the code under test.');
-  console.error('            Install Git for Windows, or set CAREEROPS_TEST_TRACE=1 for the raw stderr.');
 }
 
 export function toBashPath(wpath) {

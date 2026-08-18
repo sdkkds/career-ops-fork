@@ -21,8 +21,58 @@ export function normalizeChinese(s) {
     .trim();
 }
 
+// A company value that carries no letter and no digit is a PLACEHOLDER, not a
+// name: `?` is the documented marker for an unknown end employer (#1596), and a
+// hand-edited row can hold the tracker's other no-data sentinels (`—`, `-`).
+// Substring-matching those turns punctuation into a company signal — and since
+// replies ask questions, `?` matched almost every mail, scoring 2, corroborating
+// partial role matches, and reaching confidence `high` next to any
+// post-application keyword.
+function isPlaceholderCompany(company) {
+  return !/[\p{L}\p{N}]/u.test(company);
+}
+
+// Short names must land on a word boundary. The normalized check further down
+// has always required more than two characters, but the two substring checks
+// above it had no floor at all, so `HP` matched the word `PHP`. A boundary
+// keeps the short names that are real — HP, 3M, IBM — while refusing the ones
+// that merely occur inside a longer word.
+const SHORT_NAME_MAX = 3;
+
+// ...but only where a word boundary can exist. Chinese and Japanese run without
+// separators, so every neighbour of a name is itself a letter and the boundary
+// NEVER holds — requiring one would refuse `腾讯` inside `我们是腾讯的招聘团队`,
+// and two-character names are the norm in those scripts. They keep the
+// substring path and the normalizeChinese() handling written for them below.
+//
+// Hangul is deliberately NOT here. Korean orthography separates words with
+// spaces (띄어쓰기), so the boundary holds for it exactly as it does for Latin —
+// listing it would have waived the guard for no gain, letting a short Korean
+// name match inside a longer word, which is the very bug this rule exists to
+// stop. Found because the test asked for it never failed when Hangul was
+// removed (CodeRabbit, #3001).
+const NO_WORD_SEPARATOR_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
+
+function matchesOnWordBoundary(text, company) {
+  const escaped = company.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'iu').test(text);
+}
+
 export function checkCompanyMatch(text, company) {
   if (!company || !text) return false;
+  if (isPlaceholderCompany(company)) return false;
+
+  // A short name is decided by the boundary test alone: falling through to the
+  // substring checks below would reinstate the very match it just refused.
+  // Length is counted in CODE POINTS — `String.length` counts UTF-16 units, so a
+  // three-character supplementary-plane name reported 4 and slipped past the
+  // threshold into the substring path its BMP equivalent was refused.
+  const alphanumeric = company.replace(/[^\p{L}\p{N}]/gu, '');
+  const isShortName = Array.from(alphanumeric).length <= SHORT_NAME_MAX;
+  if (isShortName && !NO_WORD_SEPARATOR_RE.test(company)) {
+    return matchesOnWordBoundary(text, company);
+  }
+
   // Exact substring
   if (text.includes(company)) return true;
   
@@ -43,26 +93,80 @@ export function checkCompanyMatch(text, company) {
   return false;
 }
 
-export function checkRoleMatch(text, role) {
+// Generic recruiting/HR vocabulary. These words are common enough in unrelated
+// senders' signatures, job titles, and boilerplate (e.g. "Talent Acquisition &
+// Diversity" in a recruiter's signature for a *different* company/role) that
+// they must never, by themselves, count as a "significant word" match against
+// a tracker role title — regardless of length (see #2671).
+const GENERIC_ROLE_WORDS = new Set([
+  'talent', 'acquisition', 'specialist', 'coordinator', 'operations',
+  'recruiter', 'recruiting', 'human', 'resources', 'people'
+]);
+
+// Matches any CJK ideograph. Chinese role titles are normally written with no
+// whitespace/underscore separators at all ("python开发工程师" is one semantic
+// phrase, not one "word"), so the single-word rule below must not treat them
+// as a bare single word the way it does for Latin-script titles.
+const CJK_RE = /[一-鿿㐀-䶿]/;
+
+// A role title that reduces to a single word — whether that word is generic
+// recruiting vocabulary ("Recruiter") or a specific one ("Engineer") — is not
+// specific enough to stand alone as an "exact" match: checking it as a whole-
+// role substring degenerates into exactly the same bare-word check the
+// corroboration requirement exists to gate. Such roles fall through to the
+// partial-match path in checkRoleMatch(), which requires company/domain
+// corroboration in matchCandidates(). Chinese compound titles are exempted:
+// they carry no separators to split on, so "single part" doesn't mean
+// "single word" for them.
+function isSingleWordRole(role) {
+  const parts = role.split(/[\s_\\/()-]+/).filter(Boolean);
+  return parts.length === 1 && !CJK_RE.test(parts[0]);
+}
+
+// True only when the *entire* role title (or its Chinese, symbol-stripped form)
+// appears in the text as one contiguous substring. This is specific enough to
+// stand on its own, with no need for a corroborating company/domain signal —
+// unless the role is nothing but a single word (see isSingleWordRole).
+export function checkRoleMatchExact(text, role) {
   if (!role || !text) return false;
-  
+  if (isSingleWordRole(role)) return false;
+
   const tNorm = normalizeStr(text);
   const rNorm = normalizeStr(role);
+  // A whitespace-only role normalizes to '' (normalizeStr strips whitespace),
+  // and String.prototype.includes('') is always true — without this guard a
+  // blank role would "exactly" match any text at all, bypassing corroboration
+  // entirely. isSingleWordRole doesn't catch this: splitting a whitespace-only
+  // string on separators yields zero parts, not one.
+  if (!rNorm) return false;
   if (tNorm.includes(rNorm)) return true;
-
-  // Sometimes role has extra descriptors, we check if a significant part matches
-  // Like "PY01_python开发工程师" vs "python开发工程师"
-  const roleParts = role.split(/[\s_\\/()-]+/);
-  for (const part of roleParts) {
-    if (part.length > 3 && tNorm.includes(normalizeStr(part))) {
-      return true; // partial match on a significant word
-    }
-  }
 
   // Handle Chinese role titles ignoring symbols
   const cleanRole = role.replace(/[\s_\\/()-]+/g, '');
   if (cleanRole.length > 2 && tNorm.includes(cleanRole.toLowerCase())) return true;
-  
+
+  return false;
+}
+
+export function checkRoleMatch(text, role) {
+  if (!role || !text) return false;
+
+  if (checkRoleMatchExact(text, role)) return true;
+
+  const tNorm = normalizeStr(text);
+
+  // Sometimes role has extra descriptors, we check if a significant part matches
+  // Like "PY01_python开发工程师" vs "python开发工程师". Generic recruiting words
+  // (see GENERIC_ROLE_WORDS) are excluded no matter how long they are — a bare
+  // "Talent" or "Specialist" match is exactly the false-positive pattern from
+  // #2671, not evidence of a real match.
+  const roleParts = role.split(/[\s_\\/()-]+/);
+  for (const part of roleParts) {
+    if (part.length > 3 && !GENERIC_ROLE_WORDS.has(part.toLowerCase()) && tNorm.includes(normalizeStr(part))) {
+      return true; // partial match on a significant word
+    }
+  }
+
   return false;
 }
 
@@ -181,14 +285,7 @@ export function matchCandidates(candidates, apps, followups = []) {
         signals.push('company-name');
         companyHint = app.company;
       }
-      
-      const isRoleMatch = checkRoleMatch(textContext, app.role);
-      if (isRoleMatch) {
-        score += 1.5;
-        signals.push('role-title');
-        roleHint = app.role;
-      }
-      
+
       let hasDomainMatch = false;
       if (fromDomain) {
         const appDomains = getAppDomains(app, followups);
@@ -198,6 +295,22 @@ export function matchCandidates(candidates, apps, followups = []) {
           signals.push('sender-domain');
           companyHint = companyHint || app.company;
         }
+      }
+
+      // A role match on the *entire* role title is specific enough to stand on
+      // its own. A match on just one "significant word" of the role (e.g. the
+      // role split into descriptor parts) is not — those partial matches must be
+      // corroborated by a company-name or sender-domain signal, otherwise a
+      // generic multi-word title (e.g. "Talent Acquisition Specialist") lets any
+      // unrelated email that happens to contain one of those words falsely
+      // attribute itself to this application (#2671).
+      const isRoleExactMatch = checkRoleMatchExact(textContext, app.role);
+      const isRolePartialMatch = !isRoleExactMatch && checkRoleMatch(textContext, app.role);
+      const isRoleMatch = isRoleExactMatch || (isRolePartialMatch && (isCompanyMatch || hasDomainMatch));
+      if (isRoleMatch) {
+        score += 1.5;
+        signals.push('role-title');
+        roleHint = app.role;
       }
 
       const postAppKeywords = ['interview', 'offer', 'rejection', '邀您面试', '简历通过', 'next steps', 'update on your application'];
@@ -297,10 +410,12 @@ export function classifyReply(cand) {
     'job alert', 'invitation to apply', 'recommended jobs', 'newsletter', 'marketing digest', 'job recommendation', 'suggested jobs'
   ];
 
-  // 2. Offer keywords
+  // 2. Offer keywords — specific phrases only. A bare 'offer' substring is deliberately
+  //    excluded: it collides with rejection wording such as 'unable to offer' (see
+  //    rejectionKeywords) and would mis-type rejections as offers.
   const offerKeywords = [
     '录取通知书', '录用信', '录用通知', '录用', '薪资确认', '入职协议', '意向书',
-    'offer letter', 'employment agreement', 'job offer', 'congratulations on the offer', 'compensation details', 'offer'
+    'offer letter', 'employment agreement', 'job offer', 'congratulations on the offer', 'compensation details', 'pleased to offer'
   ];
 
   // 3. Rejected keywords
@@ -343,17 +458,11 @@ export function classifyReply(cand) {
     };
   }
 
-  const hasOfferKeywords = check(offerKeywords);
-  const isOffer = signal === 'offer' || hasOfferKeywords;
-  if (isOffer) {
-    if (signal === 'offer' && !evidence.includes('offer')) evidence.push('offer');
-    return {
-      type: 'Offer',
-      evidence: Array.from(new Set(evidence)),
-      suggestedTrackerUpdate: 'Offer'
-    };
-  }
-
+  // Rejection is decided before Offer: an explicit rejection signal or rejection
+  // wording (e.g. 'unable to offer', or 'we will not be sending an offer letter'
+  // which still contains the 'offer letter' phrase) must win even when offer-ish
+  // phrasing is present. Deciding Offer first would type such replies as Offer and
+  // push a spurious Offer tracker update.
   const hasRejectionKeywords = check(rejectionKeywords);
   const isRejected = signal === 'rejection' || hasRejectionKeywords;
   if (isRejected) {
@@ -362,6 +471,17 @@ export function classifyReply(cand) {
       type: 'Rejected',
       evidence: Array.from(new Set(evidence)),
       suggestedTrackerUpdate: 'Rejected'
+    };
+  }
+
+  const hasOfferKeywords = check(offerKeywords);
+  const isOffer = signal === 'offer' || hasOfferKeywords;
+  if (isOffer) {
+    if (signal === 'offer' && !evidence.includes('offer')) evidence.push('offer');
+    return {
+      type: 'Offer',
+      evidence: Array.from(new Set(evidence)),
+      suggestedTrackerUpdate: 'Offer'
     };
   }
 

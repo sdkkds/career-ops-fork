@@ -12,6 +12,6 @@
   "status": "status",
   "pdf": "pdf",
   "report": "report",
-  "url": "url",
-  "notes": "notes"
+  "notes": "notes",
+  "url": "url"
 }

@@ -42,7 +42,7 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { basename, dirname, join, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 import { appendNeedsAttention } from './lib/needs-attention.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
