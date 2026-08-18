@@ -294,6 +294,36 @@ if ($MaxJobs -lt 1) {
     exit 1
 }
 
+# ---- FORK INVARIANTS ----
+# Backstop for the local divergences an upstream merge can silently undo. Runs
+# here, before the lock and before any worker, for two reasons:
+#
+#   1. One of the invariants IS the worker's permission scoping. If a merge has
+#      restored --dangerously-skip-permissions, this run would hand untrusted job
+#      postings to a worker with no allowlist. That must not proceed unattended.
+#   2. This is the only trigger that needs no per-clone setup. A pre-push hook
+#      lives in .git/ and dies with a fresh clone; a post-merge hook does not fire
+#      at all when a merge stops on conflicts, which every real upstream sync
+#      here does. The nightly runs daily on the machine that matters, so drift
+#      surfaces within 24h even if every hook is missing.
+#
+# Exit 1, not 2: 2 means "partial batch, some postings died", which is normal.
+# A violated invariant means the checkout itself is not trustworthy.
+$invariantScript = Join-Path $PSScriptRoot 'check-fork-invariants.mjs'
+if (Test-Path $invariantScript) {
+    $invariantOut = & node $invariantScript 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Log "FATAL: fork invariant violated — refusing to run. An upstream merge has likely undone a local guarantee." 'Red'
+        foreach ($line in $invariantOut) { Write-Log "  $line" 'Red' }
+        exit 1
+    }
+    Write-Log "Fork invariants OK."
+} else {
+    # Absent is a real signal, not a shrug: the file is fork-local and declared in
+    # config/local-paths.txt, so its absence means a checkout that is not this fork.
+    Write-Log "WARN: check-fork-invariants.mjs not found at $invariantScript — fork guarantees unverified this run." 'Yellow'
+}
+
 # Lock
 if (Test-Path $LockFile) {
     $oldPid  = Get-Content $LockFile -Raw
