@@ -56,3 +56,46 @@ test('well-formed JSON in prose without a sentinel or fence is still a failure',
   assert.equal(r.ok, false);
   assert.match(r.reason, /no result block/i);
 });
+
+// Regression (2026-08-19): a worker that emitted BOTH the sentinels and a
+// ```json fence inside them failed to parse, while a worker that ignored the
+// sentinels and emitted only a fence succeeded — the fence-stripping branch
+// ran only when the sentinels were absent. That inversion punished the more
+// compliant worker and silently lost a live evaluation (Zscaler, Principal AI
+// Product Manager): "Unexpected token '`', "```json {"... is not valid JSON".
+const F = '```';
+
+test('sentinel block wrapping a ```json fence parses', () => {
+  const r = extractResultJson(
+    `CAREEROPS_RESULT_JSON_BEGIN\n${F}json\n{"status":"completed","score":3.2}\n${F}\nCAREEROPS_RESULT_JSON_END`);
+  assert.equal(r.ok, true);
+  assert.equal(r.value.score, 3.2);
+});
+
+test('sentinel block wrapping a bare ``` fence parses', () => {
+  const r = extractResultJson(
+    `CAREEROPS_RESULT_JSON_BEGIN\n${F}\n{"status":"completed","score":1.5}\n${F}\nCAREEROPS_RESULT_JSON_END`);
+  assert.equal(r.ok, true);
+  assert.equal(r.value.score, 1.5);
+});
+
+test('a fence with a non-json language tag inside the sentinels still parses', () => {
+  const r = extractResultJson(
+    `CAREEROPS_RESULT_JSON_BEGIN\n${F}JSON\n{"status":"completed"}\n${F}\nCAREEROPS_RESULT_JSON_END`);
+  assert.equal(r.ok, true);
+  assert.equal(r.value.status, 'completed');
+});
+
+test('unwrapping a fence does NOT rescue malformed JSON inside it', () => {
+  const r = extractResultJson(
+    `CAREEROPS_RESULT_JSON_BEGIN\n${F}json\n{oops\n${F}\nCAREEROPS_RESULT_JSON_END`);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /parse/i);
+});
+
+test('a stray backtick that is not a fence is left alone and fails loudly', () => {
+  const r = extractResultJson(
+    'CAREEROPS_RESULT_JSON_BEGIN\n`{"status":"completed"}`\nCAREEROPS_RESULT_JSON_END');
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /parse/i);
+});
