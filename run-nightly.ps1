@@ -318,6 +318,14 @@ if (Test-Path $invariantScript) {
         exit 1
     }
     Write-Log "Fork invariants OK."
+    # CHECK 3 (batch-tailor.mjs) warns rather than failing, so its output arrives
+    # on a zero exit. Without this loop the script's stdout was discarded on
+    # success and every warning it emits would be invisible here — a guard that
+    # nothing reads is decoration. Narrow to WARN lines so the OK line is not
+    # duplicated into the log.
+    foreach ($line in $invariantOut) {
+        if ("$line" -match '^\s*WARN:') { Write-Log "  $line" 'Yellow' }
+    }
 } else {
     # Absent is a real signal, not a shrug: the file is fork-local and declared in
     # config/local-paths.txt, so its absence means a checkout that is not this fork.

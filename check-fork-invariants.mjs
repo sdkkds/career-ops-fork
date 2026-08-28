@@ -37,6 +37,40 @@
  * worker argv line. It is not a spelling test over the whole file, because a
  * guard that fires on unrelated upstream refactors is a guard you learn to
  * ignore.
+ *
+ * CHECK 3 -- batch-tailor.mjs -- added 2026-08-28, and it WARNS rather than
+ * fails. batch-tailor.mjs:119 passes --dangerously-skip-permissions to a worker
+ * whose prompt embeds a job URL and an evaluation report, so it is the same
+ * threat class as CHECK 1: untrusted-derived content reaching a worker with
+ * full tool access. It is upstream-maintained (#1882, #2961), so a merge
+ * maintains that line exactly as it does batch-runner.sh's.
+ *
+ * Three reasons it warns instead of failing, all of which should be revisited
+ * if any of them stops being true:
+ *
+ *   1. The flag is present RIGHT NOW. This script gates the nightly at
+ *      run-nightly.ps1:312 and exit 1 there is FATAL, so failing on the current
+ *      tree would stop tonight's run over a file the nightly never invokes.
+ *      The scoping has to land before the guard can be hard.
+ *   2. batch-tailor.mjs is manual Conductor mode. run-nightly.ps1 never calls
+ *      it, so there is a human present when it runs -- a materially different
+ *      exposure from an unattended 3am batch.
+ *   3. Scoping it is not a copy of CHECK 1's allowlist, and assuming otherwise
+ *      would do real harm. batch-runner.sh's workers only evaluate offers, so
+ *      they need exactly one shell command. batch-tailor runs modes/pdf.md,
+ *      which needs npm run application:init, npm run jd:similarity, and node
+ *      find.mjs / jd-skill-gap.mjs / build-cv-html.mjs / verify-cv-facts.mjs /
+ *      generate-pdf.mjs / cv-templates.mjs / generate-cover-letter.mjs, plus
+ *      curl and file on the Canva path. Copying CHECK 1's narrow allowlist
+ *      would silently drop verify-cv-facts.mjs -- the CV fact gate, which is
+ *      exactly what the comment at batch-tailor.mjs:121-125 warns about. A
+ *      too-narrow allowlist here removes an anti-fabrication check while
+ *      looking like a security improvement.
+ *
+ * A warning is only worth emitting if something reads it: run-nightly.ps1
+ * discarded this script's stdout on success until the same commit that added
+ * this check taught it to log WARN lines. If that logging is ever removed, this
+ * check goes silent and should be deleted rather than left as decoration.
  */
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -46,8 +80,10 @@ import { fileURLToPath } from 'node:url';
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const RUNNER = join(ROOT, 'batch', 'batch-runner.sh');
 const GITATTRIBUTES = join(ROOT, '.gitattributes');
+const TAILOR = join(ROOT, 'batch-tailor.mjs');
 
 const failures = [];
+const warnings = [];
 
 if (!existsSync(RUNNER)) {
   failures.push(`batch/batch-runner.sh is missing (expected at ${RUNNER})`);
@@ -127,10 +163,59 @@ if (!existsSync(GITATTRIBUTES)) {
   }
 }
 
+// ── CHECK 3: batch-tailor.mjs permission scoping (WARNS, never fails) ───────
+// See the header for why this one is not a failure. Narrowed to the worker argv
+// array the same way CHECK 1 narrows to `claude_args=(`, so the explanatory
+// comments inside that array do not trip it.
+if (!existsSync(TAILOR)) {
+  warnings.push(
+    `batch-tailor.mjs is missing (expected at ${TAILOR}). It is upstream-maintained, so ` +
+    'this may be an upstream removal rather than a problem -- but CHECK 3 is now blind.'
+  );
+} else {
+  const lines = readFileSync(TAILOR, 'utf-8').split(/\r?\n/);
+  const start = lines.findIndex(l => /claudeArgs\s*=\s*\[/.test(l));
+
+  if (start === -1) {
+    warnings.push(
+      'could not find the worker argv array (`claudeArgs = [`) in batch-tailor.mjs -- ' +
+      'upstream may have restructured the invocation; re-check the permission scoping by hand'
+    );
+  } else {
+    let closed = false;
+    for (let i = start; i < lines.length; i++) {
+      if (i > start && /^\s*\];/.test(lines[i])) { closed = true; break; }
+      if (lines[i].includes('--dangerously-skip-permissions')) {
+        warnings.push(
+          `batch-tailor.mjs:${i + 1} passes --dangerously-skip-permissions to the worker. ` +
+          'Its prompt embeds a job URL and an evaluation report, so this is the same threat ' +
+          'class as batch-runner.sh -- but it is manual Conductor mode, not the nightly path. ' +
+          'KNOWN AND ACCEPTED, not new drift. Scoping it needs an allowlist covering all of ' +
+          "modes/pdf.md's commands; copying batch-runner.sh's narrow one would silently drop " +
+          'verify-cv-facts.mjs, the CV fact gate. Scope it deliberately or accept it deliberately.'
+        );
+      }
+    }
+    if (!closed) {
+      warnings.push(
+        'batch-tailor.mjs: the `claudeArgs = [` array never closes with `];` -- CHECK 3 read to ' +
+        'end of file, so its result is unreliable. Re-check the permission scoping by hand.'
+      );
+    }
+  }
+}
+
+if (warnings.length > 0) {
+  for (const w of warnings) console.error(`WARN: ${w}`);
+}
+
 if (failures.length > 0) {
   console.error('FORK INVARIANT VIOLATED:\n');
   for (const f of failures) console.error(`  - ${f}\n`);
   process.exit(1);
 }
 
-console.log('fork invariants OK (batch-runner permission scoping + .gitattributes rules intact)');
+console.log(
+  'fork invariants OK (batch-runner permission scoping + .gitattributes rules intact)' +
+  (warnings.length ? ` -- ${warnings.length} warning(s) above` : '')
+);
