@@ -114,9 +114,46 @@ for (let i = 0; i < toProcess.length; i++) {
   
   const prompt = `Tailor the CV for this role and generate the HTML and PDF CVs. \nURL: ${job.url}\nReport number: ${job.reportNum}${reportContext}`;
   
+  // LOCAL HARDENING (fork-only; upstream ships --dangerously-skip-permissions
+  // here and maintains that line, so check-fork-invariants.mjs CHECK 3 guards
+  // this). The worker's prompt embeds a job URL and an evaluation report derived
+  // from an untrusted job posting, so it gets an explicit allowlist instead of
+  // full tool access — the same reasoning as batch/batch-runner.sh.
+  //
+  // This allowlist is NOT batch-runner.sh's. Those workers only evaluate offers
+  // and need one shell command; this one runs modes/pdf.md, and every entry below
+  // is a command that file actually instructs. Copying the narrow list would
+  // silently drop `node verify-cv-facts.mjs` — the CV fact gate at step 19, which
+  // is exactly the anti-fabrication check the comment further down warns about
+  // losing. Re-derive this list from modes/pdf.md if that file gains a step.
+  //
+  // Deliberately absent: `curl` and `file`, used only by the Canva sub-flow
+  // (modes/pdf.md "Canva CV Generation (optional)"). That branch is gated on
+  // config/profile.yml having cv.canva_resume_design_id, which is unset, and it
+  // asks the user to choose between two flows — impossible under `claude -p`.
+  // Also absent: build-cv-latex.mjs (modes/latex.md), since this prompt asks for
+  // HTML and PDF.
+  //
+  // A missing entry fails VISIBLY: under --permission-mode dontAsk a non-allowed
+  // tool is denied and reported, and spawnSync runs with stdio: 'inherit', so it
+  // lands on screen mid-run rather than silently degrading the output.
+  const allowedTools = [
+    'Read', 'Write', 'Glob', 'Grep', 'WebFetch', 'WebSearch',
+    'Bash(node find.mjs *)',
+    'Bash(node jd-skill-gap.mjs *)',
+    'Bash(node cv-templates.mjs *)',
+    'Bash(node build-cv-html.mjs *)',
+    'Bash(node verify-cv-facts.mjs *)',
+    'Bash(node generate-pdf.mjs *)',
+    'Bash(node generate-cover-letter.mjs *)',
+    'Bash(npm run application:init *)',
+    'Bash(npm run jd:similarity *)',
+  ].join(',');
+
   const claudeArgs = [
     '-p',
-    '--dangerously-skip-permissions',
+    '--permission-mode', 'dontAsk',
+    '--allowedTools', allowedTools,
     '--append-system-prompt-file',
     // Absolute: the state file already resolves through __dirname, so passing
     // this one bare handed the worker a cwd-relative path that only exists when
