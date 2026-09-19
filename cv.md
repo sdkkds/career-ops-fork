@@ -105,3 +105,26 @@ Security Product Ownership | Vulnerability Management | Penetration-Testing Prog
 
 **Bachelor of Arts — History & Political Science**
 Brandeis University, Waltham, MA
+
+---
+
+_Last verified: 2026-09-19._ Last substantive change **2026-07-26** (`c71277f`)
+— Azure Gov leadership bullets modernised, tenure dates confirmed. (Not
+2026-08-04: three `cv*.md` files share that mtime to the second, which is a
+checkout artifact rather than an edit. Check `git log -- cv.md`, not the
+timestamp.)
+
+**Deliberate differences from `D:\sunja\docs\career\linkedin_profile_draft.md`
+— do NOT "reconcile" these away:**
+- **NCC clients** are described by tier here and kept anonymous on LinkedIn.
+  Public profile ≠ CV or interview; that split was a decision, not drift.
+- **The CompTIA certifications** are listed here and deliberately cut from the
+  LinkedIn version.
+
+**Known open items** (tracked in memory, not blockers): the `[FILL-B]` NCC
+contract/renewal figure, if it is ever shareable; and the education section
+carries no graduation year.
+
+Per the S2 living-docs rule, update this line in any session that changes this
+file or reconciles it against its siblings (`cv-beta.md`,
+`cv-azure-gov-rewrite-proposed.md`, `linkedin_profile_draft.md`).
