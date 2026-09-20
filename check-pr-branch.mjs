@@ -93,7 +93,9 @@ try {
   upstreamSha = git(['rev-parse', UPSTREAM]);
 } catch {
   console.error(`FAIL: cannot resolve ${UPSTREAM}. Add the upstream remote and fetch it:`);
-  console.error('      git remote add upstream https://github.com/santifer/career-ops.git');
+  // The project moved orgs; santifer/career-ops only resolves via GitHub's
+  // redirect, which lasts until someone claims the old path. Print the real one.
+  console.error('      git remote add upstream https://github.com/career-ops-hq/career-ops.git');
   console.error('      git fetch upstream main');
   process.exit(1);
 }
