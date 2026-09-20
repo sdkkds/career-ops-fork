@@ -249,6 +249,7 @@ function Write-Trace {
         $children = -1
         $treeCount = -1
         $orphans = -1
+        $traceErr = ''
         try {
             $snap = Get-TraceDescendants
             $tree = $snap.Tree
@@ -271,12 +272,27 @@ function Write-Trace {
                 if ($liveNow[$key] -ne $script:TraceSeen[$key]) { continue }  # PID reused
                 $orphans++
             }
-        } catch { }
+        } catch {
+            # Absorbed on purpose: a diagnostic must never end the run. But not
+            # discarded — the -1 sentinels above say the counts are unavailable,
+            # and this says why, which the bare `catch {}` threw away. A tracer
+            # that silently stops tracing is the failure it exists to detect.
+            $traceErr = ($_.Exception.Message -replace '\s+', ' ').Trim()
+        }
         $elapsed = [math]::Round(((Get-Date) - $ScriptStart).TotalSeconds, 1)
-        "{0}  +{1,8}s  pid={2}  children={3}  tree={4}  orphans={5}  {6}" -f `
-            (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $elapsed, $PID, $children, $treeCount, $orphans, $Stage |
+        $errPart = if ($traceErr) { "  trace-error=$traceErr" } else { '' }
+        "{0}  +{1,8}s  pid={2}  children={3}  tree={4}  orphans={5}  {6}{7}" -f `
+            (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $elapsed, $PID, $children, $treeCount, $orphans, $Stage, $errPart |
             Out-File $TraceLog -Encoding utf8 -Append -ErrorAction Stop
-    } catch { }
+    } catch {
+        # The trace log itself is unwritable, so it cannot carry the report of
+        # its own failure. Fall back to the run log; if that is gone too, the
+        # console is the last sink. Still absorbed — tracing must not end the
+        # run — but no longer silent.
+        $why = ($_.Exception.Message -replace '\s+', ' ').Trim()
+        try   { Write-Log "TRACE UNAVAILABLE ($Stage): $why" 'DarkYellow' }
+        catch { Write-Host "[trace] TRACE UNAVAILABLE ($Stage): $why" -ForegroundColor DarkYellow }
+    }
 }
 
 # Set-StrictMode makes `$obj.missing` a terminating error. Worker-shaped JSON is

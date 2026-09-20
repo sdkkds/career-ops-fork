@@ -46,6 +46,50 @@ $null = [System.Management.Automation.Language.Parser]::ParseFile(
 if ($parseErrors) { throw "run-nightly.ps1 has parse errors: $($parseErrors | Out-String)" }
 Write-Host "    ok" -ForegroundColor DarkGray
 
+Write-Host "1b. Fail-loud lint: no bare catch {}" -ForegroundColor Cyan
+# A bare `catch {}` sends an error down the success path and destroys the only
+# evidence it happened. Absorbing a failure is sometimes correct — a diagnostic
+# tracer must not end the run — but absorbing it SILENTLY is not: the handler
+# has to leave a record of why.
+#
+# Static, on purpose. The cases worth catching here are the ones no scenario
+# reaches: a tracer whose own log is unwritable does not happen on a healthy
+# box, so only reading the source finds it.
+# Matched on the AST, not on text. A regex for 'catch\s*\{\s*\}' also matches
+# the string inside a comment explaining why a catch is NOT bare — which it did
+# on the first run of this very check. A lint that flags prose is a lint that
+# gets switched off.
+function Get-BareCatch {
+    param([scriptblock]$Predicate = $null, $Ast)
+    @($Ast.FindAll({
+        param($n)
+        $n -is [System.Management.Automation.Language.CatchClauseAst] -and
+        $n.Body.Statements.Count -eq 0
+    }, $true))
+}
+$orchAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    "$Root\run-nightly.ps1", [ref]$null, [ref]$null)
+$bareCatch = Get-BareCatch -Ast $orchAst
+$bareCatchWhere = if ($bareCatch) {
+    ' at line(s) ' + (($bareCatch | ForEach-Object { $_.Extent.StartLineNumber }) -join ', ')
+} else { '' }
+Assert-True ($bareCatch.Count -eq 0) `
+            "no bare 'catch {}' in run-nightly.ps1 (found $($bareCatch.Count)$bareCatchWhere)"
+
+# Control: the check must be capable of firing, or the assertion above is
+# vacuous and would stay green if a bare catch were reintroduced tomorrow.
+$controlAst = [System.Management.Automation.Language.Parser]::ParseInput(
+    'try { throw "x" } catch { }', [ref]$null, [ref]$null)
+Assert-True ((Get-BareCatch -Ast $controlAst).Count -eq 1) `
+            "control: the bare-catch check detects a known bare catch"
+# And the inverse: a catch WITH a body must not be reported, or the check would
+# simply flag every catch and say nothing about silence.
+$controlAst2 = [System.Management.Automation.Language.Parser]::ParseInput(
+    'try { throw "x" } catch { Write-Host $_ }', [ref]$null, [ref]$null)
+Assert-True ((Get-BareCatch -Ast $controlAst2).Count -eq 0) `
+            "control: a catch with a body is not reported as bare"
+Write-Host "    ok" -ForegroundColor DarkGray
+
 # --- Scratch state so neither scenario pollutes the vault or the user's real
 #     data dir. Built BEFORE any node helper call below so isolation is in
 #     effect for the whole suite, not just the run-nightly.ps1 invocations.
