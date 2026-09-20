@@ -59,7 +59,7 @@
     "openai:tailor": "node openai-tailor.mjs",
     "eval:golden": "node eval-golden.mjs",
     "star": "node match-star.mjs",
-    "test:unit": "node --test tests/",
+    "test:unit": "node --test \"tests/**/*.test.mjs\"",
     "archive": "node archive-posting.mjs",
     "archive:baseline": "node archive-baseline.mjs",
     "prepare:application": "node prepare-application.mjs",
