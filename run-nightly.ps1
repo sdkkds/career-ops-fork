@@ -839,7 +839,24 @@ Write-Log "=== VAULT OUTPUT ===" 'Cyan'
 if ($DryRun) {
     Write-Log "[DRY RUN] Skipping vault output."
 } elseif ($results.Count -eq 0) {
-    Write-Log "No results to write."
+    # A run that evaluated nothing still refreshes the artifact. Skipping the
+    # write is what let morning-review.md keep displaying an EARLIER run's
+    # hits: a nightly that had stopped firing and a nightly that simply found
+    # nothing left byte-identical evidence in the one file a human opens. With
+    # the write unconditional, a stale timestamp in the heading can only mean
+    # the job did not run.
+    #
+    # decisions.jsonl is deliberately untouched here — there are no decisions
+    # to append, and it is the append-only history that this rendered view is
+    # derived from.
+    Write-Log "No results to write — refreshing the morning review as a quiet run."
+    $md  = "# Morning Review - $RunTimestamp`n`n"
+    $md += "0 top result(s) from last night's scan (evaluated 0).`n`n---`n`n"
+    $md += "_Nothing actionable this run._`n`n"
+    $md += "_This file is rewritten on every run, including quiet ones. "
+    $md += "If the heading above is not today, the nightly did not run._`n"
+    $md | Out-File $MorningReview -Encoding utf8
+    Write-Log "Morning review -> $MorningReview" 'Green'
 } else {
     Write-Log "decisions.jsonl: +$($results.Count) entries -> $DecisionsLog" 'Green'
 

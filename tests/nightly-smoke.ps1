@@ -233,8 +233,14 @@ try {
     Assert-True ($naRow -match 'eval') "needs-attention row records the eval stage"
     Assert-True ($decisions.Count -eq 1) "exactly one decision line appended (got $($decisions.Count))"
     Assert-True ($decisions[0] -match '"status":"failed"') "the decision records status=failed"
-    Assert-True (-not (Test-Path (Join-Path $VaultStub 'morning-review.md')) -or
-                 (Get-Content (Join-Path $VaultStub 'morning-review.md') -Raw) -match 'No scored results') `
+    # Tightened 2026-09-19. The old form was `-not (Test-Path ...) -or <content
+    # matches>`, which passed whether or not the file was written at all — it
+    # would have stayed green through the very defect scenario 7b now covers.
+    # A run whose only job failed still has results to render, so require the
+    # file rather than tolerating its absence.
+    Assert-True (Test-Path (Join-Path $VaultStub 'morning-review.md')) `
+                "a run whose only job failed still wrote a morning review"
+    Assert-True ((Get-Content (Join-Path $VaultStub 'morning-review.md') -Raw) -match 'No scored results') `
                 "morning review claims no scored results"
     Assert-True (@(Get-ChildItem "$Root\reports" -Filter '*-RESERVED.md' -ErrorAction SilentlyContinue).Count -eq 0) `
                 "the reserved report number was released"
@@ -290,6 +296,36 @@ try {
                  (Get-Content $Tracker -Raw) -match 'StubCo') "merge-tracker wrote the row into applications.md"
     Assert-True (@(Get-ChildItem "$Root\reports" -Filter '*-RESERVED.md' -ErrorAction SilentlyContinue).Count -eq 0) `
                 "no reservation sentinel left behind"
+
+    Write-Host "7b. A quiet run still refreshes the morning review" -ForegroundColor Cyan
+    # The failure this guards is silence, not a crash. The vault-output block
+    # skipped the write entirely when a run evaluated nothing ("No results to
+    # write"), so morning-review.md kept displaying an EARLIER run's hits. A
+    # nightly that had stopped firing and a nightly that simply found nothing
+    # produced byte-identical evidence in the one artifact a human opens.
+    #
+    # Deliberately placed after scenario 7, while the review still lists StubCo:
+    # asserting "the quiet run's review does not mention StubCo" is only
+    # meaningful if StubCo is in there to begin with. Run before it, this test
+    # would pass against the bug.
+    $quietBefore = (Get-Item $review).LastWriteTime
+    Assert-True ((Get-Content $review -Raw) -match 'StubCo') `
+                "precondition: the review lists StubCo before the quiet run"
+
+    # Nothing is actionable now: $url is past its retry budget and $okUrl drained
+    # to done, so this run evaluates zero jobs.
+    pwsh -NoProfile -File "$Root\run-nightly.ps1" -EvalOnly -MaxJobs 1 | Out-Null
+    $quietExit = $LASTEXITCODE
+    $quietText = if (Test-Path $review) { Get-Content $review -Raw -Encoding utf8 } else { '' }
+
+    Assert-True ($quietExit -eq 0) "the quiet run exited 0 (got $quietExit)"
+    Assert-True (Test-Path $review) "the quiet run still produced a morning review"
+    Assert-True ((Get-Item $review).LastWriteTime -gt $quietBefore) `
+                "the review was rewritten by the quiet run, not left from an earlier one"
+    Assert-True ($quietText -notmatch 'StubCo') `
+                "the quiet run's review no longer shows the previous run's role"
+    Assert-True ($quietText -match '0 top result') `
+                "the quiet run's review states it found nothing this run"
 
     Write-Host "8. Orchestrator error: a job is never left stranded in-progress" -ForegroundColor Cyan
     # If the worker binary is missing, PowerShell throws before any verdict
