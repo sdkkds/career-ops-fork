@@ -3,7 +3,8 @@
   Nightly career-ops orchestrator: scan portals -> evaluate new jobs -> write vault output.
 
 .DESCRIPTION
-  Correctness rules this script enforces (see .superpowers/sdd/2026-07-26-career-ops-pipeline-correctness):
+  Correctness rules this script enforces (spec: D:\sunja\docs\career-ops\2026-07-26-career-ops-pipeline-correctness-rev2.md;
+  per-task build reports in the gitignored .superpowers/sdd/2026-07-26-career-ops-pipeline-correctness):
 
     * Report numbers come from reserve-report-num.mjs (atomic, under the tracker
       lock). They are NEVER derived from filenames.
