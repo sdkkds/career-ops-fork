@@ -150,10 +150,22 @@ for (let i = 0; i < toProcess.length; i++) {
     'Bash(npm run jd:similarity *)',
   ].join(',');
 
+  // The worker inherits ~/.claude/settings.json, whose allow list grants
+  // context-mode's code-execution tools, and --allowedTools only ADDS
+  // permissions. Without this deny, a dontAsk worker reading an untrusted
+  // posting can run arbitrary code (proven 2026-10-02). Keep in sync with
+  // run-nightly.ps1; check-fork-invariants.mjs CHECK 3 guards this line.
+  const deniedTools = [
+    'mcp__plugin_context-mode_context-mode__ctx_execute',
+    'mcp__plugin_context-mode_context-mode__ctx_execute_file',
+    'mcp__plugin_context-mode_context-mode__ctx_batch_execute',
+  ].join(',');
+
   const claudeArgs = [
     '-p',
     '--permission-mode', 'dontAsk',
     '--allowedTools', allowedTools,
+    '--disallowedTools', deniedTools,
     '--append-system-prompt-file',
     // Absolute: the state file already resolves through __dirname, so passing
     // this one bare handed the worker a cwd-relative path that only exists when

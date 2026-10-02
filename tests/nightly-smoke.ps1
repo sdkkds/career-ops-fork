@@ -160,6 +160,13 @@ $url  = [regex]::Match($all, 'URL:\s*(\S+)').Groups[1].Value
 $date = [regex]::Match($all, 'Date:\s*(\S+)').Groups[1].Value
 $root = $env:CAREEROPS_SMOKE_ROOT
 
+# Record what the orchestrator handed the worker, for scenario 7's wiring
+# assertions. The resolved prompt file is deleted once the worker exits, so it
+# has to be copied now, not read afterwards.
+$args | Set-Content "$env:CAREEROPS_SMOKE_SCRATCH\last-argv.txt" -Encoding utf8
+$pi = [array]::IndexOf($args, '--append-system-prompt-file')
+if ($pi -ge 0) { Copy-Item $args[$pi + 1] "$env:CAREEROPS_SMOKE_SCRATCH\last-prompt.md" -Force }
+
 Set-Content "$root\reports\$num-stubco-$date.md" -Encoding utf8 -Value @"
 # $num - StubCo - Senior Security PM
 **Score:** 4.2/5
@@ -340,6 +347,24 @@ try {
                  (Get-Content $Tracker -Raw) -match 'StubCo') "merge-tracker wrote the row into applications.md"
     Assert-True (@(Get-ChildItem "$Root\reports" -Filter '*-RESERVED.md' -ErrorAction SilentlyContinue).Count -eq 0) `
                 "no reservation sentinel left behind"
+
+    # Worker wiring (2026-10-02). run-nightly.ps1 is fork-local, so the merge
+    # guard (check-fork-invariants.mjs) does not cover it; this does. The deny
+    # list closes inherited user-level allows for context-mode's code-execution
+    # tools; the notes stop the worker Reading a fake JD path and attempting
+    # shell writes it is not permitted.
+    $argv   = @(Get-Content "$Scratch\last-argv.txt" -Encoding utf8)
+    $prompt = Get-Content "$Scratch\last-prompt.md" -Raw -Encoding utf8
+    $di = [array]::IndexOf($argv, '--disallowedTools')
+    Assert-True ($di -ge 0) "the worker is launched with --disallowedTools"
+    $denied = if ($di -ge 0) { @($argv[$di + 1] -split ',') } else { @() }
+    foreach ($tool in 'ctx_execute', 'ctx_execute_file', 'ctx_batch_execute') {
+        Assert-True ($denied -contains "mcp__plugin_context-mode_context-mode__$tool") "the deny list names $tool"
+    }
+    Assert-True ($argv -contains '--permission-mode' -and $argv -contains 'dontAsk') "the worker still runs dontAsk"
+    Assert-True ($prompt -match '## Nightly worker notes') "the resolved prompt carries the nightly worker notes"
+    Assert-True ($prompt -notmatch 'not-pre-downloaded\.md') "the resolved prompt names no fake JD path"
+    Assert-True (($argv -join ' ') -notmatch 'not-pre-downloaded\.md') "the user message names no fake JD path"
 
     Write-Host "7b. A quiet run still refreshes the morning review" -ForegroundColor Cyan
     # The failure this guards is silence, not a crash. The vault-output block

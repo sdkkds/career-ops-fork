@@ -87,6 +87,29 @@ Remove-Item (Join-Path $t 'batch-tailor.mjs')
 $x = Invoke-Check
 Add-Case 'batch-tailor.mjs deleted' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match 'is missing')
 
+# Deny list (added 2026-10-02): the worker inherits user-level allows for
+# context-mode's code-execution tools, so losing the deny re-opens arbitrary
+# code execution with no visible symptom.
+New-Fixture
+Set-Tailor ((Get-Tailor) -replace "'--disallowedTools', deniedTools,", "")
+$x = Invoke-Check
+Add-Case '--disallowedTools dropped' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match 'disallowedTools')
+
+New-Fixture
+Set-Tailor ((Get-Tailor) -replace "'--disallowedTools', deniedTools,", "// '--disallowedTools', deniedTools,")
+$x = Invoke-Check
+Add-Case '--disallowedTools ONLY in a comment' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match 'disallowedTools')
+
+New-Fixture
+Set-Tailor ((Get-Tailor) -replace "\s*'mcp__plugin_context-mode_context-mode__ctx_execute',", "")
+$x = Invoke-Check
+Add-Case 'ctx_execute dropped from deny list' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match "ctx_execute'?\b")
+
+New-Fixture
+Set-Tailor ((Get-Tailor) -replace "\s*'mcp__plugin_context-mode_context-mode__ctx_batch_execute',", "")
+$x = Invoke-Check
+Add-Case 'ctx_batch_execute dropped' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match 'ctx_batch_execute')
+
 New-Fixture
 $f = Join-Path $t 'batch\batch-runner.sh'
 Set-Content $f ((Get-Content $f -Raw) -replace '--permission-mode dontAsk', '--dangerously-skip-permissions') -NoNewline -Encoding utf8

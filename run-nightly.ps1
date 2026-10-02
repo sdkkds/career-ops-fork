@@ -677,6 +677,31 @@ $results = [System.Collections.Generic.List[PSObject]]::new()
 # run is exact. Comparing the running total instead would pass trivially.
 $decisionsBefore = if (Test-Path $DecisionsLog) { @(Get-Content $DecisionsLog).Count } else { 0 }
 
+# Code-running tools granted by the user-level settings the worker inherits.
+# Keep in sync with batch-tailor.mjs (guarded there by check-fork-invariants.mjs).
+$WorkerDeniedTools = @(
+    'mcp__plugin_context-mode_context-mode__ctx_execute',
+    'mcp__plugin_context-mode_context-mode__ctx_execute_file',
+    'mcp__plugin_context-mode_context-mode__ctx_batch_execute'
+) -join ','
+
+# Appended to every resolved worker prompt. Each line answers an error class
+# measured over 31 nightly runs (2026-08-31..10-02): 26 failed Reads of the old
+# sentinel JD path, 4 failed Reads of absent optional inputs, and 36 dontAsk
+# denials -- every one a shell attempt to write a file that then succeeded via
+# Write. None lost work; each cost a round trip.
+$NightlyWorkerNotes = @'
+
+
+---
+
+## Nightly worker notes (appended by run-nightly.ps1)
+
+- **No JD file exists for this job.** Skip Step 1, item 1 and fetch the JD from the URL directly.
+- `article-digest.md` and `llms.txt` are optional and may be absent. Confirm a path with Glob before reading it; never Read a path you have not confirmed.
+- **Your only shell access is `node generate-pdf.mjs`, through the Bash tool.** Every other Bash or PowerShell command is denied. Write the tracker TSV and the CV HTML with the Write tool (it writes tab characters exactly). To change a file you already wrote, rewrite it with Write.
+'@
+
 Write-Log "=== EVALUATE phase ($($jobs.Count) jobs) ===" 'Cyan'
 
 $idx = 0
@@ -684,7 +709,11 @@ foreach ($job in $jobs) {
     $idx++
     $jobUrl = $job.url
     $id     = "nightly-$Date-$idx"
-    $jdFile = "$ProjectDir\jds\not-pre-downloaded.md"
+    # The nightly never pre-downloads a JD. This used to be a sentinel PATH
+    # (jds\not-pre-downloaded.md) that looked real, so the worker Read it, failed,
+    # and only then fell back to WebFetch: 26 of 31 runs, 2026-08-31..10-02. Say
+    # "none" in words; $NightlyWorkerNotes tells the worker to skip straight to the URL.
+    $jdFile = 'none (not pre-downloaded -- skip to fetching the URL)'
 
     Write-Log "  [$idx/$($jobs.Count)] $($job.company) - $($job.title)  ($jobUrl)"
 
@@ -720,13 +749,23 @@ foreach ($job in $jobs) {
         Set-Inflight -Url $jobUrl
         Set-PipelineState -Url $jobUrl -State 'in-progress'
 
-        $resolved = Resolve-BatchPrompt $jobUrl $jdFile $reportNum $Date $id
+        # batch/batch-prompt.md is upstream-maintained and already far diverged,
+        # so the nightly-specific guidance is appended here, in a fork-local file,
+        # rather than edited into it.
+        $resolved = (Resolve-BatchPrompt $jobUrl $jdFile $reportNum $Date $id) + $NightlyWorkerNotes
         $resolved | Out-File $resolvedPath -Encoding utf8
 
         $userMsg = "Procesa esta oferta de empleo. Ejecuta el pipeline completo: evaluacion A-G + report .md + PDF + tracker line. URL: $jobUrl JD file: $jdFile Report number: $reportNum Date: $Date Batch ID: $id"
 
+        # --disallowedTools: the worker inherits ~/.claude/settings.json, whose
+        # allow list grants context-mode's code-execution tools. --allowedTools
+        # only ADDS permissions, so under dontAsk a worker reading an untrusted
+        # posting could still run arbitrary code through them. Proven 2026-10-02:
+        # a Read-only dontAsk worker ran ctx_execute (RESULT=42); with this flag
+        # the tool does not exist ("No such tool available").
         & $WorkerCmd --print `
             --allowedTools "Read,Write,Glob,Grep,WebFetch,WebSearch,Bash(node generate-pdf.mjs *)" `
+            --disallowedTools $WorkerDeniedTools `
             --permission-mode dontAsk `
             --append-system-prompt-file $resolvedPath `
             $userMsg `

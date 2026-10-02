@@ -71,7 +71,15 @@
  * exit; if that logging is ever removed, delete the warning path rather than
  * leaving it as decoration.
  *
- * TESTS: check-fork-invariants.test.ps1 (fork-local). Eleven cases, every
+ * CHECK 3b -- the batch-tailor deny list -- added 2026-10-02. Workers inherit
+ * ~/.claude/settings.json, whose allow list grants context-mode's code-execution
+ * tools (ctx_execute and friends), and --allowedTools only ADDS permissions. A
+ * dontAsk worker with nothing but Read allowed ran ctx_execute and printed 42;
+ * with --disallowedTools the tool does not exist. batch-runner.sh is unaffected
+ * (it passes --strict-mcp-config, which drops all MCP tools). run-nightly.ps1
+ * carries the same deny but is fork-local, so tests/nightly-smoke.ps1 guards it.
+ *
+ * TESTS: check-fork-invariants.test.ps1 (fork-local). Fifteen cases, every
  * assertion exercised in both directions. Run it after touching this file --
  * a mutation run is what caught the fact-gate assertion matching a neighbouring
  * COMMENT instead of the allowlist, which had left a deleted entry green.
@@ -229,6 +237,14 @@ if (!existsSync(TAILOR)) {
     if (!argvText.includes('--allowedTools')) {
       failures.push('batch-tailor.mjs: the worker argv is missing the explicit --allowedTools allowlist');
     }
+    if (!argvText.includes('--disallowedTools')) {
+      failures.push(
+        'batch-tailor.mjs: the worker argv is missing `--disallowedTools`. The worker inherits ' +
+        "~/.claude/settings.json, whose allow list grants context-mode's code-execution tools; " +
+        '--allowedTools only adds permissions, so without the deny a dontAsk worker reading an ' +
+        'untrusted posting can run arbitrary code.'
+      );
+    }
     if (!argv.closed) {
       warnings.push(
         'batch-tailor.mjs: the `claudeArgs = [` array never closes with `];` -- CHECK 3 read to ' +
@@ -259,6 +275,32 @@ if (!existsSync(TAILOR)) {
         'batch-tailor.mjs: the `allowedTools = [` array never closes with `].join(` -- CHECK 3 ' +
         'read to end of file, so its result is unreliable.'
       );
+    }
+  }
+}
+
+// CHECK 3b (2026-10-02): the deny list must still name each code-running tool.
+// Matched as a quoted entry, because `ctx_execute` is a prefix of
+// `ctx_execute_file` and a substring match would pass with the bare tool gone.
+const DENIED_REQUIRED = [
+  'mcp__plugin_context-mode_context-mode__ctx_execute',
+  'mcp__plugin_context-mode_context-mode__ctx_execute_file',
+  'mcp__plugin_context-mode_context-mode__ctx_batch_execute',
+];
+if (existsSync(TAILOR)) {
+  const lines = readFileSync(TAILOR, 'utf-8').split(/\r?\n/);
+  const deny = readArrayBlock(lines, /deniedTools\s*=\s*\[/, /^\s*\]\.join\(/);
+  if (!deny) {
+    failures.push(
+      'could not find the deny-list array (`deniedTools = [`) in batch-tailor.mjs -- the ' +
+      'code-execution deny may have been restructured or dropped; re-check it by hand'
+    );
+  } else {
+    const denyText = deny.rows.map(r => r.line).join('\n');
+    for (const tool of DENIED_REQUIRED) {
+      if (!denyText.includes(`'${tool}'`)) {
+        failures.push(`batch-tailor.mjs: the deny list no longer names \`${tool}\``);
+      }
     }
   }
 }
