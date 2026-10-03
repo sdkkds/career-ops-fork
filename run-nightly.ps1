@@ -73,6 +73,10 @@
                           real ~176-row queue / 11-row tracker. Defaults to
                           $ProjectDir\data — byte-identical to the pre-override
                           paths when unset.
+    CAREEROPS_LOG_DIR     Redirects batch\logs (run log, trace log, scan log,
+                          per-eval worker logs). Added 2026-10-03: without it
+                          every smoke run appended stub output to the real
+                          nightly-<date>.log. Defaults to $ProjectDir\batch\logs.
   Removed 2026-08-01: CAREEROPS_ALLOW_SCAN. It gated an LLM+Playwright scan over
   untrusted portals. Scan is now `node scan.mjs` — no LLM, no browser, no shell in
   the untrusted-content path — so the risk the interlock existed for is gone. See
@@ -117,7 +121,8 @@ $ScriptStart   = Get-Date
 # `evaluated_at` the digest cursor compares against, and reformatting it would
 # change the digest window semantics.
 $RunTimestampIso = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-$LogDir        = "$ProjectDir\batch\logs"
+$LogDir        = if ($env:CAREEROPS_LOG_DIR) { $env:CAREEROPS_LOG_DIR }
+                 else { "$ProjectDir\batch\logs" }
 $ReportsDir    = "$ProjectDir\reports"
 $TsvDir        = "$ProjectDir\batch\tracker-additions"
 $BatchPrompt   = "$ProjectDir\batch\batch-prompt.md"
@@ -734,7 +739,10 @@ foreach ($job in $jobs) {
     }
 
     $resolvedPath = "$ProjectDir\batch\.resolved-nightly-$idx.md"
-    $logFile      = "$LogDir\$reportNum-nightly-$idx.log"
+    # Named by $id (nightly-<date>-<idx>), not by slot. Report numbers are reused
+    # after a failed eval (the reservation is released), so "<num>-nightly-<idx>"
+    # collided across nights and a later run overwrote an earlier failure's log.
+    $logFile      = "$LogDir\$reportNum-$id.log"
 
     $r = $null
     try {

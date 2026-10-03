@@ -240,6 +240,28 @@ $pipelineBackup   = Get-Content $RealPipelineFile -Raw -Encoding utf8
 $trackerBackup    = Get-Content $RealTracker -Raw -Encoding utf8
 $needsBackup      = if (Test-Path $RealNeedsAttn) { Get-Content $RealNeedsAttn -Raw -Encoding utf8 } else { $null }
 
+# Logs go to scratch. Until 2026-10-03 run-nightly.ps1 had no log override, so
+# every smoke run appended its stub output to the REAL nightly-<date>.log (the
+# 10-02 log carried 37 EVALUATE sections for one real run), and the cleanup
+# below swept '*-nightly-*.log' / '*-nightly-*.tsv' by name -- which matches
+# every real worker log and every archived real tracker TSV. Only the latest
+# run's worker logs survived anywhere.
+$ScratchLogs = Join-Path $Scratch 'logs'
+$env:CAREEROPS_LOG_DIR = $ScratchLogs
+
+# Decoys shaped exactly like real nightly artifacts. They must survive the run,
+# and the real run log for today must be untouched; both are asserted after the
+# finally block, once cleanup has run. (A real 06:00 nightly overlapping this
+# suite would legitimately change the run log -- do not run the suite then.)
+$RealLogDir  = "$Root\batch\logs"
+$DecoyLog    = Join-Path $RealLogDir '000-nightly-2099-01-01-1.log'
+$DecoyTsv    = Join-Path "$Root\batch\tracker-additions\merged" '000-nightly-2099-01-01-1.tsv'
+$RealRunLog  = Join-Path $RealLogDir "nightly-$((Get-Date).ToString('yyyy-MM-dd')).log"
+$runLogBefore = if (Test-Path $RealRunLog) { (Get-FileHash $RealRunLog).Hash } else { 'absent' }
+New-Item -ItemType Directory -Force -Path (Split-Path $DecoyTsv) | Out-Null
+Set-Content $DecoyLog 'decoy: a real worker log the smoke suite must not delete' -Encoding utf8
+Set-Content $DecoyTsv "000`t2099-01-01`tDecoyCo`tReal Role`tEvaluated`t3.0/5`t-`t[000](reports/000-decoyco-2099-01-01.md)`treal note" -Encoding utf8
+
 try {
     Write-Host "3. Dry run, eval only" -ForegroundColor Cyan
     $env:CAREEROPS_VAULT_DIR = $VaultStub
@@ -365,6 +387,15 @@ try {
     Assert-True ($prompt -match '## Nightly worker notes') "the resolved prompt carries the nightly worker notes"
     Assert-True ($prompt -notmatch 'not-pre-downloaded\.md') "the resolved prompt names no fake JD path"
     Assert-True (($argv -join ' ') -notmatch 'not-pre-downloaded\.md') "the user message names no fake JD path"
+    # Worker logs are named per run, not per nightly slot: report numbers are
+    # reused after a failed eval, so "<num>-nightly-<idx>.log" collided across
+    # nights (118-nightly-1 was written on 09-19, 10-02 and 10-03).
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+    Assert-True (@(Get-ChildItem $ScratchLogs -Filter "*-nightly-$today-1.log" -ErrorAction SilentlyContinue).Count -ge 1) `
+                "the worker log is named <num>-nightly-<date>-<idx>.log, under CAREEROPS_LOG_DIR"
+    Assert-True (@(Get-ChildItem $RealLogDir -Filter "*-nightly-$today-*.log" -ErrorAction SilentlyContinue |
+                   Where-Object { (Get-Content $_.FullName -Raw) -match 'StubCo|Chatty preamble' }).Count -eq 0) `
+                "no stub worker log landed in the real batch\logs"
 
     Write-Host "7b. A quiet run still refreshes the morning review" -ForegroundColor Cyan
     # The failure this guards is silence, not a crash. The vault-output block
@@ -603,13 +634,28 @@ finally {
     Get-ChildItem "$Root\reports" -Filter '*-RESERVED.md' -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
     # merge-tracker moves consumed TSVs into merged/, so clean both locations.
+    # The TSV path is the worker contract and cannot be redirected, so stub TSVs
+    # land beside real ones under the SAME name shape. Delete by CONTENT: only a
+    # stub worker writes the 'smoke stub' notes column. The old name sweep
+    # ('*-nightly-*.tsv') deleted every real archived TSV too.
     foreach ($dir in @("$Root\batch\tracker-additions", "$Root\batch\tracker-additions\merged")) {
         Get-ChildItem $dir -Filter '*-nightly-*.tsv' -ErrorAction SilentlyContinue |
+            Where-Object { (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match "`tsmoke stub\s*$" } |
             Remove-Item -Force -ErrorAction SilentlyContinue
     }
-    Get-ChildItem "$Root\batch\logs" -Filter '*-nightly-*.log' -ErrorAction SilentlyContinue |
-        Remove-Item -Force -ErrorAction SilentlyContinue
+    # No log sweep: CAREEROPS_LOG_DIR points inside $Scratch, removed here.
     Remove-Item $Scratch -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item Env:\CAREEROPS_LOG_DIR -ErrorAction SilentlyContinue
+}
+
+Write-Host "Cleanup leaves real artifacts alone" -ForegroundColor Cyan
+try {
+    Assert-True (Test-Path $DecoyLog) "a real-looking worker log in batch\logs survived the suite"
+    Assert-True (Test-Path $DecoyTsv) "a real-looking merged tracker TSV survived the suite"
+    $runLogAfter = if (Test-Path $RealRunLog) { (Get-FileHash $RealRunLog).Hash } else { 'absent' }
+    Assert-True ($runLogAfter -eq $runLogBefore) "today's real run log was not written by the suite"
+} finally {
+    Remove-Item $DecoyLog, $DecoyTsv -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host "SMOKE OK" -ForegroundColor Green
