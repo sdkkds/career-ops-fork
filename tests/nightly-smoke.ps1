@@ -384,6 +384,28 @@ try {
         Assert-True ($denied -contains "mcp__plugin_context-mode_context-mode__$tool") "the deny list names $tool"
     }
     Assert-True ($argv -contains '--permission-mode' -and $argv -contains 'dontAsk') "the worker still runs dontAsk"
+
+    # Worker isolation (2026-10-09, fix matrix career-ops #17-#19). --allowedTools
+    # only ADDS to the allow rules a worker inherits from settings files, so the
+    # 10-02 deny of three tools left curl/gh/WebFetch/unscoped Write reachable. A
+    # control run proved the worker could rewrite generate-pdf.mjs and then run it.
+    # The value is asserted EXACTLY, not by substring: widening it to bare `Bash`
+    # or `Write` must fail here (that was C3, a smoke test that never read it).
+    function ArgAfter($flag) { $i = [array]::IndexOf($argv, $flag); if ($i -ge 0 -and $i + 1 -lt $argv.Count) { $argv[$i + 1] } else { $null } }
+    $joined = $argv -join ' '
+    $wNum   = [regex]::Match($joined, 'Report number:\s*(\d+)').Groups[1].Value
+    $wId    = [regex]::Match($joined, 'Batch ID:\s*(\S+)').Groups[1].Value
+    $wHost  = ([Uri]$okUrl).Host
+    Assert-True ($argv -contains '--restricted') "the worker runs --restricted (inherits no user/project/local settings)"
+    Assert-True ($argv -contains '--strict-mcp-config') "the worker runs --strict-mcp-config (no inherited MCP servers)"
+    Assert-True ((ArgAfter '--permission-mode') -ceq 'dontAsk') "--permission-mode is exactly dontAsk, not merely present"
+    Assert-True ((ArgAfter '--tools') -ceq 'Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Bash') "--tools is exactly the built-in set the worker needs"
+    $wantAllowed = "Read,Glob,Grep,WebSearch," +
+                   "Edit(/reports/$wNum-*.md),Edit(/batch/tracker-additions/$wNum-$wId.tsv),Edit(/output/cv-candidate-*.html)," +
+                   "WebFetch(domain:$wHost),WebFetch(domain:*.$wHost)," +
+                   "Bash(node generate-pdf.mjs *)"
+    Assert-True ($wNum -and $wId) "the report number and batch id were recovered from the worker argv"
+    Assert-True ((ArgAfter '--allowedTools') -ceq $wantAllowed) "--allowedTools is exactly the per-job scoped list (got '$(ArgAfter '--allowedTools')')"
     Assert-True ($prompt -match '## Nightly worker notes') "the resolved prompt carries the nightly worker notes"
     Assert-True ($prompt -notmatch 'not-pre-downloaded\.md') "the resolved prompt names no fake JD path"
     Assert-True (($argv -join ' ') -notmatch 'not-pre-downloaded\.md') "the user message names no fake JD path"

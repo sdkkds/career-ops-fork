@@ -689,6 +689,8 @@ $decisionsBefore = if (Test-Path $DecisionsLog) { @(Get-Content $DecisionsLog).C
 
 # Code-running tools granted by the user-level settings the worker inherits.
 # Keep in sync with batch-tailor.mjs (guarded there by check-fork-invariants.mjs).
+# Since 2026-10-09 the worker runs --restricted and inherits no settings files,
+# so these tools no longer reach it; the deny stays as a second layer.
 $WorkerDeniedTools = @(
     'mcp__plugin_context-mode_context-mode__ctx_execute',
     'mcp__plugin_context-mode_context-mode__ctx_execute_file',
@@ -710,6 +712,7 @@ $NightlyWorkerNotes = @'
 - **No JD file exists for this job.** Skip Step 1, item 1 and fetch the JD from the URL directly.
 - `article-digest.md` and `llms.txt` are optional and may be absent. Confirm a path with Glob before reading it; never Read a path you have not confirmed.
 - **Your only shell access is `node generate-pdf.mjs`, through the Bash tool.** Every other Bash or PowerShell command is denied. Write the tracker TSV and the CV HTML with the Write tool (it writes tab characters exactly). To change a file you already wrote, rewrite it with Write.
+- **You can write only three files:** your report under `reports/` (prefixed with your report number), your TSV under `batch/tracker-additions/`, and `output/cv-candidate-*.html`. Any other write is denied. WebFetch is limited to the posting's own domain; use WebSearch for research.
 '@
 
 Write-Log "=== EVALUATE phase ($($jobs.Count) jobs) ===" 'Cyan'
@@ -770,14 +773,41 @@ foreach ($job in $jobs) {
 
         $userMsg = "Procesa esta oferta de empleo. Ejecuta el pipeline completo: evaluacion A-G + report .md + PDF + tracker line. URL: $jobUrl JD file: $jdFile Report number: $reportNum Date: $Date Batch ID: $id"
 
-        # --disallowedTools: the worker inherits ~/.claude/settings.json, whose
-        # allow list grants context-mode's code-execution tools. --allowedTools
-        # only ADDS permissions, so under dontAsk a worker reading an untrusted
-        # posting could still run arbitrary code through them. Proven 2026-10-02:
-        # a Read-only dontAsk worker ran ctx_execute (RESULT=42); with this flag
-        # the tool does not exist ("No such tool available").
+        # Worker isolation (2026-10-09, fix matrix career-ops #17-#19).
+        # --allowedTools only ADDS to the allow rules a worker inherits from
+        # settings files. The 2026-10-02 fix denied three context-mode tools by
+        # name (a Read-only dontAsk worker had run ctx_execute, RESULT=42), but
+        # the inherited Bash(curl -s *), Bash(gh api *) etc. stayed reachable, and
+        # bare Write + Bash(node generate-pdf.mjs *) let a control run rewrite
+        # generate-pdf.mjs and then execute it ("PWNED-REWRITE").
+        #   --restricted        ignore user/project/local settings files (and
+        #                       their hooks); confine file tools to this repo
+        #   --strict-mcp-config load no MCP servers
+        #   --tools             the built-in tools that exist at all
+        #   --allowedTools      what runs without asking, scoped to THIS job.
+        #                       Write is scoped through Edit(path) rules: Claude
+        #                       Code never consults path rules written on Write.
+        # Proven with a two-arm control run and a multi-line generate-pdf check.
+        # tests/nightly-smoke.ps1 asserts the exact value.
+        # WebFetch is scoped to the posting's registrable domain (plus its
+        # subdomains, so boards.x.io -> job-boards.x.io redirects still work).
+        # Two-letter ccTLDs with a generic second level (co.uk, com.au) keep three
+        # labels, or the rule would open the whole country.
+        $postHost = ([Uri]$jobUrl).Host.ToLowerInvariant()
+        if (-not $postHost) { throw "cannot scope WebFetch: no host in job URL '$jobUrl'" }
+        $hostLabels = $postHost.Split('.')
+        $keep = if ($hostLabels.Count -ge 3 -and $hostLabels[-1].Length -eq 2 -and
+                    $hostLabels[-2] -in @('co', 'com', 'org', 'net', 'gov', 'ac', 'edu')) { 3 } else { 2 }
+        $postDomain = if ($hostLabels.Count -gt $keep) { ($hostLabels[(-$keep)..-1]) -join '.' } else { $postHost }
+        $workerAllowed = "Read,Glob,Grep,WebSearch," +
+                         "Edit(/reports/$reportNum-*.md),Edit(/batch/tracker-additions/$reportNum-$id.tsv),Edit(/output/cv-candidate-*.html)," +
+                         "WebFetch(domain:$postDomain),WebFetch(domain:*.$postDomain)," +
+                         "Bash(node generate-pdf.mjs *)"
         & $WorkerCmd --print `
-            --allowedTools "Read,Write,Glob,Grep,WebFetch,WebSearch,Bash(node generate-pdf.mjs *)" `
+            --restricted `
+            --strict-mcp-config `
+            --tools "Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Bash" `
+            --allowedTools $workerAllowed `
             --disallowedTools $WorkerDeniedTools `
             --permission-mode dontAsk `
             --append-system-prompt-file $resolvedPath `
