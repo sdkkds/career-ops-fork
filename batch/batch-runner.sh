@@ -918,7 +918,39 @@ process_offer() {
   # LOCAL HARDENING (kept across the v1.22 upgrade): upstream ships
   # --dangerously-skip-permissions here. Batch workers read untrusted job
   # postings, so they get an explicit allowlist instead of full tool access.
-  local -a claude_args=(-p --strict-mcp-config --permission-mode dontAsk --allowedTools "Read,Write,Glob,Grep,WebFetch,WebSearch,Bash(node generate-pdf.mjs *)")
+  # LOCAL HARDENING 2026-10-09 (fix matrix career-ops #17-#19): --allowedTools
+  # only ADDS to the allow rules a worker inherits from settings files, so a
+  # bare Write next to Bash(node generate-pdf.mjs *) let a worker rewrite that
+  # script and run it (proven by control run). --restricted drops inherited
+  # settings and their hooks; --tools fixes the built-in set; the allowlist is
+  # per job: its own report and TSV, the CV HTML (Edit(path) rules -- path rules
+  # on Write are never consulted), and WebFetch on the posting's registrable
+  # domain. Same shape as run-nightly.ps1. Keep every flag on the one line that
+  # declares the worker argv array: check-fork-invariants.mjs CHECK 1 and
+  # test-all #506 read that line, and test-all takes the FIRST line containing
+  # the declaration text, so never spell it out in a comment above it.
+  local post_host="${url#*://}"
+  post_host="${post_host%%[/:?#]*}"
+  post_host="$(printf '%s' "$post_host" | tr '[:upper:]' '[:lower:]')"   # bash 3.2-safe (no ${,,})
+  local -a host_labels=()
+  IFS=. read -ra host_labels <<< "$post_host"
+  local n_labels=${#host_labels[@]} keep_labels=2 post_domain="$post_host"
+  if (( n_labels >= 3 )) && [[ ${#host_labels[n_labels-1]} -eq 2 && " co com org net gov ac edu " == *" ${host_labels[n_labels-2]} "* ]]; then
+    keep_labels=3
+  fi
+  if (( n_labels > keep_labels )); then
+    post_domain="$(IFS=.; echo "${host_labels[*]:n_labels-keep_labels}")"
+  fi
+  local worker_fetch=""
+  if [[ -n "$post_domain" && "$url" == http* ]]; then
+    worker_fetch="WebFetch(domain:${post_domain}),WebFetch(domain:*.${post_domain}),"
+  fi
+  local worker_allowed="Read,Glob,Grep,WebSearch,Edit(/reports/${report_num}-*.md),Edit(/batch/tracker-additions/${report_num}-${id}.tsv),Edit(/output/cv-candidate-*.html),${worker_fetch}Bash(node generate-pdf.mjs *)"
+  local -a claude_args=(-p --restricted --strict-mcp-config --permission-mode dontAsk --tools "Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Bash" --allowedTools "$worker_allowed")
+  # The prefetched JD lives in a mktemp dir outside the repo; --restricted
+  # confines file tools to the working directories, so add that one (read-only:
+  # no Edit rule covers it).
+  claude_args+=(--add-dir "$(dirname "$jd_file")")
   if [[ -n "$RESOLVED_MODEL" ]]; then
     claude_args+=(--model "$RESOLVED_MODEL")
   fi
@@ -930,7 +962,9 @@ process_offer() {
   local max_shim_retries=4
   while true; do
     exit_code=0
-    claude "${claude_args[@]}" > "$log_file" 2>&1 || exit_code=$?
+    # From the project root: the Edit(/reports/...) rules and the prompt's
+    # relative write paths resolve against the worker's working directory.
+    (cd "$PROJECT_DIR" && claude "${claude_args[@]}") > "$log_file" 2>&1 || exit_code=$?
 
     if [[ $exit_code -eq 0 ]]; then
       break

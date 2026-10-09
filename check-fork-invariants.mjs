@@ -79,7 +79,19 @@
  * (it passes --strict-mcp-config, which drops all MCP tools). run-nightly.ps1
  * carries the same deny but is fork-local, so tests/nightly-smoke.ps1 guards it.
  *
- * TESTS: check-fork-invariants.test.ps1 (fork-local). Fifteen cases, every
+ * ISOLATION -- added 2026-10-09 (fix matrix career-ops #17-#19). The deny list
+ * above was the wrong shape: --allowedTools only ADDS to the allow rules a worker
+ * inherits, so Bash(curl -s *), Bash(gh api *) and friends stayed reachable, and
+ * a bare Write next to an allowed `node ...` command let a control-run worker
+ * rewrite generate-pdf.mjs and then execute it. Both workers now run
+ * --restricted --strict-mcp-config with no bare Write or WebFetch in the
+ * allowlist; CHECK 1 and CHECK 3 fail if any of that is undone. The same pass
+ * fixed two blind spots: CHECK 3 accepted ANY --permission-mode value (C1), and
+ * CHECK 1 never read `claude_args+=(` appends (C2). CHECK 1 also skips comment
+ * lines now -- a comment spelling out the declaration was read as the argv line.
+ * The deny list stays as a second layer.
+ *
+ * TESTS: check-fork-invariants.test.ps1 (fork-local). Twenty-six cases, every
  * assertion exercised in both directions. Run it after touching this file --
  * a mutation run is what caught the fact-gate assertion matching a neighbouring
  * COMMENT instead of the allowlist, which had left a deleted entry green.
@@ -104,9 +116,46 @@ if (!existsSync(RUNNER)) {
 
   // The worker argv line: the one that builds claude_args, not the comments
   // above it that mention the flag by name while explaining why it is absent.
-  const argvLines = lines
+  // Comment lines are excluded outright (2026-10-09): a comment that spelled out
+  // the declaration text was read as the argv line and failed the whole check.
+  const code = lines
     .map((line, i) => ({ line, n: i + 1 }))
-    .filter(({ line }) => /claude_args=\(/.test(line));
+    .filter(({ line }) => !/^\s*#/.test(line));
+  const argvLines = code.filter(({ line }) => /claude_args=\(/.test(line));
+
+  // C2 (2026-10-09): the argv is extended with `claude_args+=(` lines, which the
+  // declaration regex above never read -- so an upstream
+  // `claude_args+=(--dangerously-skip-permissions)` would have passed.
+  for (const { line, n } of code.filter(({ line }) => /claude_args\+=\(/.test(line))) {
+    if (line.includes('--dangerously-skip-permissions')) {
+      failures.push(
+        `batch/batch-runner.sh:${n} appends --dangerously-skip-permissions to the worker argv. ` +
+        'Batch workers read untrusted job postings; re-apply the scoping.'
+      );
+    }
+  }
+
+  // Isolation (2026-10-09, fix matrix career-ops #17-#19): the per-job allowlist
+  // must not contain bare Write or bare WebFetch. Writes are scoped through
+  // Edit(path) rules and fetches to the posting's domain.
+  const allowedDecl = code.find(({ line }) => /\bworker_allowed="/.test(line));
+  if (!allowedDecl) {
+    failures.push(
+      'could not find the per-job allowlist (`worker_allowed="...`) in batch/batch-runner.sh -- ' +
+      'the worker isolation may have been undone; re-check the permission scoping by hand'
+    );
+  } else {
+    const value = (allowedDecl.line.match(/worker_allowed="([^"]*)"/) || [])[1] || '';
+    for (const bare of ['Write', 'WebFetch']) {
+      if (value.split(',').map(s => s.trim()).includes(bare)) {
+        failures.push(
+          `batch/batch-runner.sh:${allowedDecl.n} allows bare \`${bare}\`. Scope writes with ` +
+          'Edit(path) rules and fetches with WebFetch(domain:...); a bare Write next to ' +
+          'Bash(node generate-pdf.mjs *) lets a worker rewrite that script and run it.'
+        );
+      }
+    }
+  }
 
   if (argvLines.length === 0) {
     failures.push(
@@ -134,6 +183,13 @@ if (!existsSync(RUNNER)) {
     // the argv; flagging it here too keeps the local edit from breaking their suite.
     if (!line.includes('--strict-mcp-config')) {
       failures.push(`batch/batch-runner.sh:${n} is missing \`--strict-mcp-config\` (upstream test #506)`);
+    }
+    if (!/(^|\s)--restricted(\s|$)/.test(line)) {
+      failures.push(
+        `batch/batch-runner.sh:${n} is missing \`--restricted\`. Without it the worker inherits ` +
+        "every allow rule in the user's settings files (e.g. Bash(curl -s *)), because " +
+        '--allowedTools only adds permissions.'
+      );
     }
   }
 }
@@ -231,8 +287,19 @@ if (!existsSync(TAILOR)) {
         );
       }
     }
-    if (!argvText.includes('--permission-mode')) {
-      failures.push('batch-tailor.mjs: the worker argv is missing `--permission-mode dontAsk`');
+    // C1 (2026-10-09): the VALUE is checked, not just the flag. Presence alone
+    // passed `'--permission-mode', 'bypassPermissions'`.
+    if (!/'--permission-mode',\s*'dontAsk'/.test(argvText)) {
+      failures.push('batch-tailor.mjs: the worker argv is missing `--permission-mode dontAsk` (flag absent or another mode)');
+    }
+    if (!argvText.includes("'--restricted'")) {
+      failures.push(
+        'batch-tailor.mjs: the worker argv is missing `--restricted`. Without it the worker ' +
+        "inherits every allow rule in the user's settings files, because --allowedTools only adds."
+      );
+    }
+    if (!argvText.includes("'--strict-mcp-config'")) {
+      failures.push('batch-tailor.mjs: the worker argv is missing `--strict-mcp-config` (inherits every MCP server)');
     }
     if (!argvText.includes('--allowedTools')) {
       failures.push('batch-tailor.mjs: the worker argv is missing the explicit --allowedTools allowlist');
@@ -269,6 +336,15 @@ if (!existsSync(TAILOR)) {
         'fact gate (modes/pdf.md step 19). Losing it does not fail a run, it silently produces an ' +
         'unverified CV, so nothing else would catch this.'
       );
+    }
+    for (const bare of ['Write', 'WebFetch']) {
+      if (allowText.includes(`'${bare}'`)) {
+        failures.push(
+          `batch-tailor.mjs: the allowlist has bare \`${bare}\`. Scope writes with Edit(path) rules ` +
+          'and fetches with WebFetch(domain:...); a bare Write next to the allowed node commands ' +
+          'lets a worker rewrite a script and then run it.'
+        );
+      }
     }
     if (!allow.closed) {
       warnings.push(

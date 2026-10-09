@@ -116,6 +116,70 @@ Set-Content $f ((Get-Content $f -Raw) -replace '--permission-mode dontAsk', '--d
 $x = Invoke-Check
 Add-Case 'CHECK 1 still fatal' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match 'batch-runner')
 
+# ── Worker isolation (2026-10-09, fix matrix career-ops #17-#19, C1, C2) ──────
+# --allowedTools only ADDS to inherited allow rules; a control run proved a
+# worker with bare Write could rewrite generate-pdf.mjs and then run it. Both
+# workers now run --restricted --strict-mcp-config with no bare Write/WebFetch.
+function Get-Runner { Get-Content (Join-Path $t 'batch\batch-runner.sh') -Raw }
+function Set-Runner([string]$new) { Set-Content (Join-Path $t 'batch\batch-runner.sh') $new -NoNewline -Encoding utf8 }
+
+New-Fixture
+Set-Runner ((Get-Runner) -replace 'claude_args=\(-p --restricted ', 'claude_args=(-p ')
+$x = Invoke-Check
+Add-Case 'runner: --restricted dropped' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match 'batch-runner.*--restricted')
+
+# C2: the old check read only `claude_args=(` and never the `+=` appends.
+New-Fixture
+Set-Runner ((Get-Runner) -replace '(\r?\n)(\s*)claude_args\+=\(--add-dir', '$1$2claude_args+=(--dangerously-skip-permissions)$1$2claude_args+=(--add-dir')
+$x = Invoke-Check
+Add-Case 'runner: skip-perms via += (C2)' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match 'dangerously-skip-permissions')
+
+New-Fixture
+Set-Runner ((Get-Runner) -replace '(\r?\n)(\s*)claude_args\+=\(--add-dir', '$1$2# upstream: claude_args+=(--dangerously-skip-permissions)$1$2claude_args+=(--add-dir')
+$x = Invoke-Check
+Add-Case 'runner: += flag only in a comment' 'exit 0' $x ($x.Exit -eq 0)
+
+New-Fixture
+Set-Runner ((Get-Runner) -replace 'worker_allowed="Read,', 'worker_allowed="Read,Write,')
+$x = Invoke-Check
+Add-Case 'runner: bare Write in allowlist' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match 'bare')
+
+New-Fixture
+Set-Runner ((Get-Runner) -replace 'worker_allowed="Read,', 'worker_allowed="Read,WebFetch,')
+$x = Invoke-Check
+Add-Case 'runner: bare WebFetch in allowlist' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match 'bare')
+
+New-Fixture
+Set-Tailor ((Get-Tailor) -replace "\s*'--restricted',", "")
+$x = Invoke-Check
+Add-Case 'tailor: --restricted dropped' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match 'tailor.*--restricted')
+
+New-Fixture
+Set-Tailor ((Get-Tailor) -replace "\s*'--strict-mcp-config',", "")
+$x = Invoke-Check
+Add-Case 'tailor: --strict-mcp-config dropped' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match 'strict-mcp-config')
+
+# C1: presence of --permission-mode was enough to pass, whatever its value.
+New-Fixture
+Set-Tailor ((Get-Tailor) -replace "'--permission-mode', 'dontAsk',", "'--permission-mode', 'bypassPermissions',")
+$x = Invoke-Check
+Add-Case 'tailor: mode = bypassPermissions (C1)' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match 'dontAsk')
+
+New-Fixture
+Set-Tailor ((Get-Tailor) -replace "'Read', 'Glob',", "'Read', 'Write', 'Glob',")
+$x = Invoke-Check
+Add-Case 'tailor: bare Write in allowlist' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match 'bare')
+
+New-Fixture
+Set-Tailor ((Get-Tailor) -replace "'Read', 'Glob',", "'Read', 'WebFetch', 'Glob',")
+$x = Invoke-Check
+Add-Case 'tailor: bare WebFetch in allowlist' 'exit 1' $x ($x.Exit -eq 1 -and $x.Text -match 'bare')
+
+New-Fixture
+Set-Tailor ((Get-Tailor) -replace "'Read', 'Glob',", "// 'Write' and 'WebFetch' were bare here before 2026-10-09`r`n    'Read', 'Glob',")
+$x = Invoke-Check
+Add-Case 'tailor: bare Write ONLY in a comment' 'exit 0' $x ($x.Exit -eq 0)
+
 $r | Format-Table -AutoSize
 $failed = @($r | Where-Object { -not $_.Pass }).Count
 if ($failed -eq 0) { "PASS: $($r.Count)/$($r.Count) cases" } else { "FAIL: $failed of $($r.Count) cases" }

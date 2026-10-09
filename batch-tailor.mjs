@@ -15,6 +15,21 @@ const batchStateFile = process.env.CAREER_OPS_BATCH_STATE
   : join(__dirname, 'batch', 'batch-state.tsv');
 const reportsDir = join(__dirname, 'reports');
 
+// WebFetch is scoped to the posting's registrable domain plus its subdomains
+// (boards.x.io -> job-boards.x.io redirects keep working). Two-letter ccTLDs
+// with a generic second level (co.uk, com.au) keep three labels, or the rule
+// would open the whole country. Same rule as run-nightly.ps1 and
+// batch/batch-runner.sh. Returns null for a URL with no http(s) host.
+function postingDomain(url) {
+  let host;
+  try { host = new URL(url).hostname.toLowerCase(); } catch { return null; }
+  if (!host || !/^https?:/.test(url)) return null;
+  const labels = host.split('.');
+  const keep = labels.length >= 3 && labels.at(-1).length === 2 &&
+    ['co', 'com', 'org', 'net', 'gov', 'ac', 'edu'].includes(labels.at(-2)) ? 3 : 2;
+  return labels.length > keep ? labels.slice(-keep).join('.') : host;
+}
+
 const USAGE = `career-ops batch tailor — bulk generate tailored CVs for high-scoring batch jobs
 
 Usage:
@@ -112,7 +127,17 @@ for (let i = 0; i < toProcess.length; i++) {
   const matchingReport = reports.find(f => f.startsWith(`${job.reportNum}-`) && f.endsWith('.md'));
   const reportContext = matchingReport ? `\nThe evaluation report is available at: reports/${matchingReport}` : '';
   
-  const prompt = `Tailor the CV for this role and generate the HTML and PDF CVs. \nURL: ${job.url}\nReport number: ${job.reportNum}${reportContext}`;
+  // Batch-mode notes. The worker runs isolated (see claudeArgs below): it can
+  // write only under jds/ and output/, so modes/pdf.md's /tmp render payload and
+  // its direct tracker edit are redirected here rather than left to be denied.
+  const batchNotes = [
+    'Batch-mode notes (non-interactive, written by batch-tailor.mjs):',
+    '- Write the render payload JSON to `output/.payload/cv-{candidate}-{company}.json`, not /tmp, and pass that path to build-cv-html.mjs.',
+    '- Do not edit data/applications.md. The PDF flag is synced from data/pdf-index.tsv by merge-tracker.mjs.',
+    '- Nobody can answer questions in this run: skip steps that ask the user, the cover letter, and saving house rules to modes/_custom.md. Report skill gaps in your final summary instead.',
+    '- WebFetch is limited to the posting\'s own domain; use WebSearch for research.',
+  ].join('\n');
+  const prompt = `Tailor the CV for this role and generate the HTML and PDF CVs. \nURL: ${job.url}\nReport number: ${job.reportNum}${reportContext}\n\n${batchNotes}`;
   
   // LOCAL HARDENING (fork-only; upstream ships --dangerously-skip-permissions
   // here and maintains that line, so check-fork-invariants.mjs CHECK 3 guards
@@ -137,8 +162,20 @@ for (let i = 0; i < toProcess.length; i++) {
   // A missing entry fails VISIBLY: under --permission-mode dontAsk a non-allowed
   // tool is denied and reported, and spawnSync runs with stdio: 'inherit', so it
   // lands on screen mid-run rather than silently degrading the output.
+  //
+  // Since 2026-10-09 (fix matrix career-ops #17-#19) there is no bare Write and
+  // no bare WebFetch: writes are scoped through Edit(path) rules (Claude Code
+  // never consults path rules written on Write) to jds/ (pdf.md step 4's JD
+  // scratch file) and output/ (bundles, payload JSON); WebFetch to the posting's
+  // domain. Commands like build-cv-html/generate-pdf write their own files and
+  // need no Edit rule.
+  const domain = postingDomain(job.url);
+  const fetchRules = domain ? [`WebFetch(domain:${domain})`, `WebFetch(domain:*.${domain})`] : [];
   const allowedTools = [
-    'Read', 'Write', 'Glob', 'Grep', 'WebFetch', 'WebSearch',
+    'Read', 'Glob', 'Grep', 'WebSearch',
+    'Edit(/jds/*.md)',
+    'Edit(/output/**)',
+    ...fetchRules,
     'Bash(node find.mjs *)',
     'Bash(node jd-skill-gap.mjs *)',
     'Bash(node cv-templates.mjs *)',
@@ -161,8 +198,15 @@ for (let i = 0; i < toProcess.length; i++) {
     'mcp__plugin_context-mode_context-mode__ctx_batch_execute',
   ].join(',');
 
+  // --restricted: inherit no user/project/local settings (their allow rules and
+  // hooks) and confine file tools to the repo. --strict-mcp-config: no MCP
+  // servers. --tools: the built-in tools that exist at all. The deny list below
+  // stays as a second layer.
   const claudeArgs = [
     '-p',
+    '--restricted',
+    '--strict-mcp-config',
+    '--tools', 'Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Bash',
     '--permission-mode', 'dontAsk',
     '--allowedTools', allowedTools,
     '--disallowedTools', deniedTools,
@@ -176,7 +220,9 @@ for (let i = 0; i < toProcess.length; i++) {
     prompt
   ];
   
-  const res = spawnSync('claude', claudeArgs, { stdio: 'inherit' });
+  // cwd = the project root: the Edit(/jds/...) and Edit(/output/...) rules and
+  // pdf.md's relative paths resolve against the worker's working directory.
+  const res = spawnSync('claude', claudeArgs, { stdio: 'inherit', cwd: __dirname });
   if (res.error) {
     console.error(`Error running claude: ${res.error.message}`);
   } else if (res.status !== 0) {
