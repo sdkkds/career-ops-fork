@@ -99,7 +99,12 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 
 # Paths
-$ProjectDir    = "D:\sunja\projects\consulting\career-ops"
+# The script's own checkout, not a hardcoded path. The scheduled wrapper calls
+# this file by its main-repo path, so production is unchanged; a copy run from a
+# worktree now operates on that worktree instead of silently on main (found
+# 2026-10-09: the smoke suite run from a worktree reserved report numbers and
+# rewrote batch\.nightly-inflight.json in the main repo).
+$ProjectDir    = $PSScriptRoot
 $VaultDir      = if ($env:CAREEROPS_VAULT_DIR) { $env:CAREEROPS_VAULT_DIR }
                  else { "D:\sunja\projects\personal\Fortress of Solitude\career-ops" }
 # Redirects every live-data path this script touches (pipeline.md,
