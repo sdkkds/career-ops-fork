@@ -1019,18 +1019,31 @@ process_offer() {
     # 019 — Deepgram JD unextractable in headless mode). Only the downstream
     # reconcile-pipeline.mjs safety net (which leaves an entry in Pending when
     # its report file is missing) prevented the offer from being lost.
-    # Extract only the LAST ```json fenced block in the log -- that's the
-    # worker's one authoritative final result (batch-prompt.md Step 6), not
-    # arbitrary text anywhere else in stdout/stderr -- and parse it as real
-    # JSON so an unrelated line merely containing the substring
-    # `"status": "failed"` can never falsely flip a successful run.
-    local worker_result_json
-    worker_result_json=$(awk '
-      /^```json[[:space:]]*$/ { in_block=1; block=""; next }
-      in_block && /^```[[:space:]]*$/ { in_block=0; last=block; next }
-      in_block { block = block $0 "\n" }
-      END { printf "%s", last }
-    ' "$log_file" 2>/dev/null || true)
+    # Extract the worker's one authoritative final result, not arbitrary text
+    # anywhere else in stdout/stderr, and parse it as real JSON so an unrelated
+    # line merely containing the substring `"status": "failed"` can never
+    # falsely flip a successful run. lib/json-extract.mjs is the same reader the
+    # nightly uses: the LAST CAREEROPS_RESULT_JSON_BEGIN/END block (the
+    # batch-prompt.md Step 6 contract), with or without a fence inside or
+    # around it, else the last ```json fence (the Step 1 hard-stop path).
+    # This used to be an awk scan for ```json fences only, so a worker that
+    # followed Step 6 exactly was recorded `completed` with score "-" (#30,
+    # found 2026-10-09). The log goes in on stdin and only the module path is
+    # an argument, so Git Bash converts the one path node needs.
+    # "No result block" (exit 0, empty) and "the extractor itself broke"
+    # (nonzero, e.g. the module moved) are different: the second must not be
+    # read as the first, or every job silently records score "-" again.
+    local worker_result_json extract_rc=0
+    worker_result_json=$(node -e '
+      const { pathToFileURL } = require("node:url");
+      let data = "";
+      process.stdin.on("data", d => data += d);
+      process.stdin.on("end", async () => {
+        const { extractResultJson } = await import(pathToFileURL(process.argv[1]).href);
+        const r = extractResultJson(data);
+        if (r.ok) process.stdout.write(JSON.stringify(r.value));
+      });
+    ' "$PROJECT_DIR/lib/json-extract.mjs" < "$log_file" 2>/dev/null) || extract_rc=$?
 
     # Parse status, error, AND score from the same authoritative JSON object
     # in one pass -- score extraction used to be a separate sed regex over
@@ -1042,7 +1055,10 @@ process_offer() {
     # as status/error fixes both by construction -- there's only one place
     # left to look.
     local worker_failed_match="" worker_error_match="" score="-"
-    if [[ -n "$worker_result_json" ]]; then
+    if (( extract_rc != 0 )); then
+      worker_failed_match="failed"
+      worker_error_match="result extractor failed (node exit $extract_rc; check lib/json-extract.mjs)"
+    elif [[ -n "$worker_result_json" ]]; then
       local parsed
       parsed=$(printf '%s' "$worker_result_json" | node -e '
         let data = "";
