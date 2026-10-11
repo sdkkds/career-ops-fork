@@ -741,6 +741,20 @@ process_offer() {
   # could pre-create it as a symlink and redirect or clobber the write.
   local jd_file
   jd_file="$(mktemp "${TMPDIR:-/tmp}/batch-jd-${id}.XXXXXX")"
+  # The path the WORKER is given (prompt text, {{JD_FILE}} and --add-dir all
+  # use this one, so they agree by construction). Under Git Bash the worker is
+  # a native Windows program, and MSYS converts a path only when it is a whole
+  # argument: `--add-dir /tmp` arrived as the Windows temp dir while the same path
+  # inside the prompt text stayed /tmp/..., so the --restricted worker could
+  # not read its own JD and re-fetched every posting (#31). cygpath -m gives a
+  # native path with forward slashes, which MSYS leaves alone. On Linux/macOS
+  # there is no cygpath and the POSIX path is already native. Bash-side code
+  # (curl --output, rm) keeps using $jd_file. A cygpath failure stops the run
+  # under `set -e` rather than quietly handing the worker an unreadable path.
+  local jd_file_worker="$jd_file"
+  if command -v cygpath >/dev/null 2>&1; then
+    jd_file_worker="$(cygpath -m "$jd_file")"
+  fi
 
   # Pre-populate $jd_file with a static curl fetch so the worker reads HTML
   # directly instead of always falling through to WebFetch (#2492). WebFetch is
@@ -868,7 +882,7 @@ process_offer() {
     prompt="Process this job offer. Run the full pipeline: A-G evaluation + report .md + optional PDF + tracker line."
   fi
   prompt="$prompt URL: $url"
-  prompt="$prompt JD file: $jd_file"
+  prompt="$prompt JD file: $jd_file_worker"
   prompt="$prompt Report number: $report_num"
   prompt="$prompt Date: $date"
   prompt="$prompt Batch ID: $id"
@@ -881,7 +895,7 @@ process_offer() {
   local esc_url esc_jd_file esc_report_num esc_date esc_id
   esc_url="${url//\\/\\\\}"
   esc_url="${esc_url//|/\\|}"
-  esc_jd_file="${jd_file//\\/\\\\}"
+  esc_jd_file="${jd_file_worker//\\/\\\\}"
   esc_jd_file="${esc_jd_file//|/\\|}"
   esc_report_num="${report_num//|/\\|}"
   esc_date="${date//|/\\|}"
@@ -950,7 +964,7 @@ process_offer() {
   # The prefetched JD lives in a mktemp dir outside the repo; --restricted
   # confines file tools to the working directories, so add that one (read-only:
   # no Edit rule covers it).
-  claude_args+=(--add-dir "$(dirname "$jd_file")")
+  claude_args+=(--add-dir "$(dirname "$jd_file_worker")")
   if [[ -n "$RESOLVED_MODEL" ]]; then
     claude_args+=(--model "$RESOLVED_MODEL")
   fi
